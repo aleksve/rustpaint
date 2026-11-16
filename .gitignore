@@ -1,0 +1,14 @@
+# Build output
+/target
+**/*.rs.bk
+
+# QA / scratch images
+*.png
+!examples/*.png
+!docs/*.png
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

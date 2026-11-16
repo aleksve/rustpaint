@@ -1,0 +1,15 @@
+# RustPaint is optimized for the machine that builds it.
+# Override RUSTFLAGS when producing a portable release binary.
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# GNU ld is the system linker on the supported Linux build environment.
+# This controls linker output optimization; LLVM LTO is configured in Cargo.toml.
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    "-C",
+    "target-cpu=native",
+    "-C",
+    "link-arg=-Wl,-O3",
+]
+
