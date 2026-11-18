@@ -1,24 +1,24 @@
-//! A dependency free file browser.
+//! Built-in themed file browser.
 //!
-//! Native file dialogs would mean pulling in GTK on Linux / extra platform
-//! crates, so RustPaint ships its own small browser: it looks and behaves the
-//! same on Windows, macOS and Linux.
+//! Used automatically when no native platform file dialog is available (for
+//! example headless sessions or Linux window managers without an XDG desktop
+//! portal), or whenever the user unchecks *File → Use system file dialogs*.
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Context, FontId, Pos2, Rect, Rounding, Sense, Vec2};
+use eframe::egui::{self, Context, FontId, Pos2, Rect, Sense, Vec2};
 
 use crate::icons::{self, Icon};
 use crate::theme::Theme;
-use crate::widgets;
+use crate::widgets::{self, ButtonKind, rr};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub(crate) enum Mode {
     Open,
     Save,
 }
 
-pub enum FileAction {
+pub(crate) enum FileAction {
     None,
     Cancel,
     Accept {
@@ -35,47 +35,125 @@ struct Entry {
     size: u64,
 }
 
-pub struct FileDialog {
+pub(crate) struct FileDialog {
     mode: Mode,
     dir: PathBuf,
     name: String,
     entries: Vec<Entry>,
+    /// Sidebar places cached on dialog open (never re-probed every frame).
+    places: Vec<(String, PathBuf)>,
     sel: Option<PathBuf>,
     error: Option<String>,
-    formats: Vec<(&'static str, &'static str)>,
+    /// Set when the user clicks Save for an already-existing file path.
+    confirm_overwrite: Option<(PathBuf, &'static str)>,
     fmt: usize,
     path_edit: String,
 }
 
 const SAVE_FORMATS: &[(&str, &str)] = &[("PNG", "png"), ("JPEG", "jpg"), ("BMP", "bmp")];
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
+pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
 
-pub fn is_supported_extension(ext: &str) -> bool {
+pub(crate) fn is_supported_extension(ext: &str) -> bool {
     SUPPORTED_EXTENSIONS
         .iter()
         .any(|supported| supported.eq_ignore_ascii_case(ext))
 }
 
+fn format_index_for_extension(ext: &str) -> Option<usize> {
+    if ext.eq_ignore_ascii_case("png") {
+        Some(0)
+    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        Some(1)
+    } else if ext.eq_ignore_ascii_case("bmp") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    crate::prefs::home().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn collect_places() -> Vec<(String, PathBuf)> {
+    let home = home_dir();
+    let mut out = Vec::with_capacity(10);
+    if home.is_dir() {
+        out.push(("Home".to_string(), home.clone()));
+    }
+    for (label, sub) in [
+        ("Desktop", "Desktop"),
+        ("Documents", "Documents"),
+        ("Downloads", "Downloads"),
+        ("Pictures", "Pictures"),
+    ] {
+        let p = home.join(sub);
+        if p.is_dir() {
+            out.push((label.to_string(), p));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && !out.iter().any(|(_, existing)| existing == &cwd)
+    {
+        out.push(("Working dir".to_string(), cwd));
+    }
+    #[cfg(windows)]
+    {
+        for l in 'A'..='Z' {
+            let p = PathBuf::from(format!("{l}:\\"));
+            if p.is_dir() {
+                out.push((format!("{l}:"), p));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        out.push(("Root".to_string(), PathBuf::from("/")));
+    }
+    out
 }
 
 /// Resolve the folder a dialog should open in: the caller's suggestion (last
 /// used folder) if it still exists, otherwise the usual pictures/home folders.
 fn start_dir(hint: Option<PathBuf>) -> PathBuf {
-    if let Some(d) = hint {
-        if d.is_dir() {
-            return d;
-        }
+    if let Some(d) = hint
+        && d.is_dir()
+    {
+        return d;
     }
     let d = crate::prefs::default_dir();
     if d.is_dir() {
         return d;
     }
     std::env::current_dir().unwrap_or_else(|_| home_dir())
+}
+
+/// Normalise a typed save filename so it ends with `.{ext}` (or `.jpeg` when
+/// saving JPEG) without stripping non-image dot suffixes such as `project.v2`.
+fn normalize_save_name(raw: &str, ext: &str) -> Option<String> {
+    let mut name = raw.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let current_ext = Path::new(&name).extension().and_then(|e| e.to_str());
+    let already_matches = match current_ext {
+        Some(e) if ext == "jpg" => e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"),
+        Some(e) => e.eq_ignore_ascii_case(ext),
+        None => false,
+    };
+    if !already_matches {
+        // Only strip a trailing known image extension; leave names like `logo.v2` intact.
+        if let Some(e) = current_ext
+            && is_supported_extension(e)
+            && let Some(dot) = name.rfind('.')
+            && !name[dot..].contains(['/', '\\'])
+        {
+            name.truncate(dot);
+        }
+        name.push('.');
+        name.push_str(ext);
+    }
+    Some(name)
 }
 
 impl FileDialog {
@@ -87,9 +165,10 @@ impl FileDialog {
             path_edit: dir.display().to_string(),
             dir,
             entries: Vec::new(),
+            places: collect_places(),
             sel: None,
             error: None,
-            formats: SAVE_FORMATS.to_vec(),
+            confirm_overwrite: None,
             fmt: 0,
         };
         d.refresh();
@@ -98,22 +177,23 @@ impl FileDialog {
 
     pub fn save(default_name: &str, hint: Option<PathBuf>) -> Self {
         let dir = start_dir(hint);
+        let fmt = Path::new(default_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(format_index_for_extension)
+            .unwrap_or(0);
         let mut d = Self {
             mode: Mode::Save,
             name: default_name.to_string(),
             path_edit: dir.display().to_string(),
             dir,
             entries: Vec::new(),
+            places: collect_places(),
             sel: None,
             error: None,
-            formats: SAVE_FORMATS.to_vec(),
-            fmt: 0,
+            confirm_overwrite: None,
+            fmt,
         };
-        if let Some(ext) = default_name.rsplit('.').next() {
-            if let Some(i) = d.formats.iter().position(|(_, e)| *e == ext) {
-                d.fmt = i;
-            }
-        }
         d.refresh();
         d
     }
@@ -122,15 +202,14 @@ impl FileDialog {
         if self.mode == Mode::Save {
             return true;
         }
-        let ext = p
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        is_supported_extension(&ext)
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(is_supported_extension)
     }
 
     fn refresh(&mut self) {
         self.entries.clear();
+        self.confirm_overwrite = None;
         self.path_edit = self.dir.display().to_string();
         let rd = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd,
@@ -142,15 +221,16 @@ impl FileDialog {
         self.error = None;
         for e in rd.flatten() {
             let path = e.path();
-            let name = e.file_name().to_string_lossy().to_string();
+            let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
             }
-            let is_dir = path.is_dir();
+            let meta = e.metadata().ok();
+            let is_dir = meta.as_ref().map_or_else(|| path.is_dir(), |m| m.is_dir());
             if !is_dir && !self.allowed(&path) {
                 continue;
             }
-            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = meta.map_or(0, |m| m.len());
             self.entries.push(Entry {
                 name,
                 path,
@@ -158,11 +238,8 @@ impl FileDialog {
                 size,
             });
         }
-        self.entries.sort_by(|a, b| {
-            b.dir
-                .cmp(&a.dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        self.entries
+            .sort_by_cached_key(|e| (!e.dir, e.name.to_lowercase()));
     }
 
     fn nav_to(&mut self, p: PathBuf) {
@@ -170,55 +247,71 @@ impl FileDialog {
             self.dir = p;
             self.sel = None;
             self.refresh();
+        } else {
+            self.error = Some(format!("Folder not found: {}", p.display()));
         }
     }
 
     fn up(&mut self) {
-        if let Some(parent) = self.dir.parent() {
-            let parent = parent.to_path_buf();
+        if let Some(parent) = self.dir.parent().map(Path::to_path_buf) {
             self.nav_to(parent);
         }
     }
 
-    fn accept(&mut self) -> FileAction {
-        let ext = self.formats[self.fmt].1;
-        let path = match self.mode {
-            Mode::Open => match &self.sel {
-                Some(p) if p.is_file() => p.clone(),
-                _ => {
-                    // fall back to the typed name
-                    let p = self.dir.join(self.name.trim());
-                    if p.is_file() {
-                        p
-                    } else {
-                        self.error = Some("Select a file to open".into());
-                        return FileAction::None;
-                    }
-                }
-            },
-            Mode::Save => {
-                let mut name = self.name.trim().to_string();
-                if name.is_empty() {
-                    self.error = Some("Enter a file name".into());
-                    return FileAction::None;
-                }
-                if !name.to_lowercase().ends_with(&format!(".{ext}")) {
-                    // replace a foreign extension instead of stacking two
-                    if let Some(dot) = name.rfind('.') {
-                        if !name[dot..].contains('/') && name.len() - dot <= 6 {
-                            name.truncate(dot);
+    fn accept(&mut self, force_overwrite: bool) -> FileAction {
+        let ext = SAVE_FORMATS[self.fmt].1;
+        match self.mode {
+            Mode::Open => {
+                let candidate = match &self.sel {
+                    Some(p) if p.is_file() => Some(p.clone()),
+                    _ => {
+                        let typed = self.name.trim();
+                        if typed.is_empty() {
+                            None
+                        } else {
+                            let p = self.dir.join(typed);
+                            if p.is_dir() {
+                                self.nav_to(p);
+                                return FileAction::None;
+                            }
+                            p.is_file().then_some(p)
                         }
                     }
-                    name.push('.');
-                    name.push_str(ext);
+                };
+                match candidate {
+                    Some(path) => FileAction::Accept {
+                        path,
+                        ext,
+                        save: false,
+                    },
+                    None => {
+                        self.error = Some("Select a file to open".into());
+                        FileAction::None
+                    }
                 }
-                self.dir.join(name)
             }
-        };
-        FileAction::Accept {
-            path,
-            ext,
-            save: self.mode == Mode::Save,
+            Mode::Save => {
+                let Some(name) = normalize_save_name(&self.name, ext) else {
+                    self.error = Some("Enter a file name".into());
+                    return FileAction::None;
+                };
+                let path = self.dir.join(name);
+                if path.is_dir() {
+                    self.error = Some("A folder with that name already exists".into());
+                    return FileAction::None;
+                }
+                if path.exists() && !force_overwrite {
+                    self.error = None;
+                    self.confirm_overwrite = Some((path, ext));
+                    return FileAction::None;
+                }
+                self.confirm_overwrite = None;
+                FileAction::Accept {
+                    path,
+                    ext,
+                    save: true,
+                }
+            }
         }
     }
 
@@ -226,6 +319,7 @@ impl FileDialog {
         let size = Vec2::new(760.0, 520.0);
         let mut action = FileAction::None;
         let mut cancel = false;
+
         widgets::modal(ctx, th, "file", size, |ui| {
             let title = if self.mode == Mode::Open {
                 "Open image"
@@ -248,12 +342,11 @@ impl FileDialog {
                     .on_hover_text("Home folder")
                     .clicked()
                 {
-                    let h = home_dir();
-                    self.nav_to(h);
+                    self.nav_to(home_dir());
                 }
-                let w = ui.available_width() - 40.0;
+                let w = (ui.available_width() - 8.0).max(120.0);
                 let resp = ui.add_sized(
-                    Vec2::new(w.max(120.0), 28.0),
+                    Vec2::new(w, 28.0),
                     egui::TextEdit::singleline(&mut self.path_edit)
                         .font(FontId::proportional(12.0)),
                 );
@@ -264,15 +357,15 @@ impl FileDialog {
             });
             ui.add_space(6.0);
 
-            // ---- body
-            let body_h = size.y - 210.0;
+            // ---- body (places + virtualised file list)
+            let body_h = size.y - 216.0;
             let mut go_to: Option<PathBuf> = None;
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
                     Vec2::new(130.0, body_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        places_ui(ui, th, &self.dir, &mut go_to);
+                        places_ui(ui, th, &self.places, &self.dir, &mut go_to);
                     },
                 );
                 ui.add_space(4.0);
@@ -281,37 +374,26 @@ impl FileDialog {
                     Vec2::new(list_w, body_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                        let row_h = 26.0;
+                        let mut navigate: Option<PathBuf> = None;
+                        let mut pick: Option<(PathBuf, String)> = None;
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .max_height(body_h)
-                            .show(ui, |ui| {
+                            .show_rows(ui, row_h, self.entries.len(), |ui, row_range| {
                                 ui.set_width(ui.available_width());
-                                let mut navigate: Option<PathBuf> = None;
-                                let mut pick: Option<PathBuf> = None;
-                                for e in &self.entries {
-                                    let label = if e.dir {
-                                        format!("{}/", e.name)
-                                    } else {
-                                        e.name.clone()
-                                    };
+                                for idx in row_range {
+                                    let e = &self.entries[idx];
                                     let selected = self.sel.as_deref() == Some(e.path.as_path());
                                     let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(ui.available_width(), 26.0),
+                                        Vec2::new(ui.available_width(), row_h),
                                         Sense::click(),
                                     );
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            Rounding::same(6.0),
-                                            th.hover,
-                                        );
-                                    }
+                                    let p = ui.painter();
                                     if selected {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            Rounding::same(6.0),
-                                            th.accent_soft,
-                                        );
+                                        p.rect_filled(rect, rr(6), th.accent_soft);
+                                    } else if resp.hovered() {
+                                        p.rect_filled(rect, rr(6), th.hover);
                                     }
                                     let ic = if e.dir { Icon::Folder } else { Icon::File };
                                     let ir = Rect::from_center_size(
@@ -319,27 +401,51 @@ impl FileDialog {
                                         Vec2::splat(14.0),
                                     );
                                     icons::draw(
-                                        ui.painter(),
+                                        p,
                                         ic,
                                         ir,
                                         if e.dir { th.accent } else { th.text_dim },
                                         1.4,
                                     );
-                                    ui.painter().text(
-                                        Pos2::new(rect.left() + 28.0, rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &label,
-                                        FontId::proportional(12.5),
-                                        th.text,
+
+                                    // Clip the filename column so long names never overwrite size.
+                                    let name_right = if e.dir {
+                                        rect.right() - 8.0
+                                    } else {
+                                        rect.right() - 78.0
+                                    };
+                                    let name_clip = Rect::from_min_max(
+                                        Pos2::new(rect.left() + 26.0, rect.top()),
+                                        Pos2::new(
+                                            name_right.max(rect.left() + 40.0),
+                                            rect.bottom(),
+                                        ),
                                     );
-                                    if !e.dir {
+                                    let name_painter =
+                                        p.with_clip_rect(name_clip.intersect(p.clip_rect()));
+                                    if e.dir {
+                                        name_painter.text(
+                                            Pos2::new(rect.left() + 28.0, rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            format!("{}/", e.name),
+                                            FontId::proportional(12.5),
+                                            th.text,
+                                        );
+                                    } else {
+                                        name_painter.text(
+                                            Pos2::new(rect.left() + 28.0, rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &e.name,
+                                            FontId::proportional(12.5),
+                                            th.text,
+                                        );
                                         let kb = e.size as f64 / 1024.0;
-                                        let txt = if kb > 1024.0 {
+                                        let txt = if kb >= 1024.0 {
                                             format!("{:.1} MB", kb / 1024.0)
                                         } else {
                                             format!("{:.0} KB", kb.max(1.0))
                                         };
-                                        ui.painter().text(
+                                        p.text(
                                             Pos2::new(rect.right() - 10.0, rect.center().y),
                                             egui::Align2::RIGHT_CENTER,
                                             txt,
@@ -347,14 +453,7 @@ impl FileDialog {
                                             th.text_dim,
                                         );
                                     }
-                                    if resp.clicked() {
-                                        if e.dir {
-                                            navigate = Some(e.path.clone());
-                                        } else {
-                                            pick = Some(e.path.clone());
-                                            self.name = e.name.clone();
-                                        }
-                                    }
+
                                     if resp.double_clicked() {
                                         if e.dir {
                                             navigate = Some(e.path.clone());
@@ -364,17 +463,34 @@ impl FileDialog {
                                                 ext: "",
                                                 save: false,
                                             };
-                                            return;
+                                        } else {
+                                            pick = Some((e.path.clone(), e.name.clone()));
+                                        }
+                                    } else if resp.clicked() {
+                                        if e.dir {
+                                            navigate = Some(e.path.clone());
+                                        } else {
+                                            pick = Some((e.path.clone(), e.name.clone()));
                                         }
                                     }
                                 }
-                                if let Some(p) = navigate {
-                                    self.nav_to(p);
-                                }
-                                if let Some(p) = pick {
-                                    self.sel = Some(p);
-                                }
                             });
+                        if let Some(p) = navigate {
+                            self.nav_to(p);
+                        }
+                        if let Some((path, name)) = pick {
+                            self.sel = Some(path);
+                            self.name = name;
+                            self.confirm_overwrite = None;
+                            if self.mode == Mode::Save
+                                && let Some(i) = Path::new(&self.name)
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .and_then(format_index_for_extension)
+                            {
+                                self.fmt = i;
+                            }
+                        }
                     },
                 );
             });
@@ -386,10 +502,12 @@ impl FileDialog {
             ui.add_space(6.0);
 
             // ---- file name + format + buttons
+            let mut submit_from_enter = false;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Name").size(12.0).color(th.text_dim));
-                let w = (ui.available_width() - 200.0).max(140.0);
-                ui.add_sized(
+                let reserve = if self.mode == Mode::Save { 200.0 } else { 12.0 };
+                let w = (ui.available_width() - reserve).max(140.0);
+                let name_resp = ui.add_sized(
                     Vec2::new(w, 28.0),
                     egui::TextEdit::singleline(&mut self.name)
                         .hint_text(if self.mode == Mode::Save {
@@ -399,14 +517,20 @@ impl FileDialog {
                         })
                         .font(FontId::proportional(12.5)),
                 );
+                if name_resp.changed() {
+                    self.confirm_overwrite = None;
+                }
+                if name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit_from_enter = true;
+                }
                 if self.mode == Mode::Save {
-                    for (i, (label, _)) in self.formats.iter().enumerate() {
+                    for (i, (label, _)) in SAVE_FORMATS.iter().enumerate() {
                         let active = self.fmt == i;
                         let (rect, resp) =
                             ui.allocate_exact_size(Vec2::new(40.0, 28.0), Sense::click());
                         let bg = if active { th.accent } else { th.raised };
                         let fg = if active { th.on_accent } else { th.text_dim };
-                        ui.painter().rect_filled(rect, Rounding::same(7.0), bg);
+                        ui.painter().rect_filled(rect, rr(7), bg);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -414,92 +538,99 @@ impl FileDialog {
                             FontId::proportional(11.0),
                             fg,
                         );
-                        if resp.clicked() {
+                        if resp.clicked() && self.fmt != i {
                             self.fmt = i;
+                            self.confirm_overwrite = None;
                         }
                     }
                 }
             });
 
+            if submit_from_enter {
+                let a = self.accept(false);
+                if !matches!(a, FileAction::None) {
+                    action = a;
+                }
+            }
+
             if let Some(err) = &self.error {
                 ui.label(egui::RichText::new(err).size(11.5).color(th.danger));
             }
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let go = if self.mode == Mode::Open {
-                        "Open"
-                    } else {
-                        "Save"
-                    };
-                    if widgets::button(ui, th, go, true).clicked() {
-                        let a = self.accept();
-                        if !matches!(a, FileAction::None) {
-                            action = a;
+            ui.add_space(6.0);
+            if let Some((overwrite_path, overwrite_ext)) = self.confirm_overwrite.clone() {
+                let fname = overwrite_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| overwrite_path.display().to_string());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Replace existing “{fname}”?"))
+                            .size(12.0)
+                            .color(th.danger),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::button_styled(ui, th, "Replace", ButtonKind::Danger, true)
+                            .clicked()
+                        {
+                            self.confirm_overwrite = None;
+                            action = FileAction::Accept {
+                                path: overwrite_path,
+                                ext: overwrite_ext,
+                                save: true,
+                            };
                         }
-                    }
-                    if widgets::button(ui, th, "Cancel", false).clicked() {
-                        cancel = true;
-                    }
+                        if widgets::button(ui, th, "Cancel", false).clicked() {
+                            self.confirm_overwrite = None;
+                        }
+                    });
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let go = if self.mode == Mode::Open {
+                            "Open"
+                        } else {
+                            "Save"
+                        };
+                        if widgets::button(ui, th, go, true).clicked() {
+                            let a = self.accept(false);
+                            if !matches!(a, FileAction::None) {
+                                action = a;
+                            }
+                        }
+                        if widgets::button(ui, th, "Cancel", false).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            }
         });
-        if cancel {
-            return FileAction::Cancel;
-        }
-        if ui_escape(ctx) {
+
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             return FileAction::Cancel;
         }
         action
     }
 }
 
-fn ui_escape(ctx: &Context) -> bool {
-    ctx.input(|i| i.key_pressed(egui::Key::Escape))
-}
-
-fn places_ui(ui: &mut egui::Ui, th: &Theme, dir: &Path, go_to: &mut Option<PathBuf>) {
-    let home = home_dir();
-    let mut candidates: Vec<(String, PathBuf)> = vec![("Home".to_string(), home.clone())];
-    for (label, sub) in [
-        ("Desktop", "Desktop"),
-        ("Documents", "Documents"),
-        ("Downloads", "Downloads"),
-        ("Pictures", "Pictures"),
-    ] {
-        let p = home.join(sub);
-        if p.is_dir() {
-            candidates.push((label.to_string(), p));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(("Working dir".to_string(), cwd));
-    }
-    #[cfg(windows)]
-    {
-        for l in 'A'..='Z' {
-            let p = PathBuf::from(format!("{l}:\\"));
-            if p.is_dir() {
-                candidates.push((format!("{}:", l), p));
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        candidates.push(("Root".to_string(), PathBuf::from("/")));
-    }
-
+fn places_ui(
+    ui: &mut egui::Ui,
+    th: &Theme,
+    places: &[(String, PathBuf)],
+    dir: &Path,
+    go_to: &mut Option<PathBuf>,
+) {
     ui.label(egui::RichText::new("PLACES").size(10.0).color(th.text_dim));
     ui.add_space(4.0);
-    for (label, path) in candidates {
+    for (label, path) in places {
         let selected = dir == path.as_path();
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
         if resp.hovered() || selected {
             ui.painter().rect_filled(
                 rect,
-                Rounding::same(6.0),
+                rr(6),
                 if selected { th.accent_soft } else { th.hover },
             );
         }
@@ -511,7 +642,7 @@ fn places_ui(ui: &mut egui::Ui, th: &Theme, dir: &Path, go_to: &mut Option<PathB
             if selected { th.accent } else { th.text },
         );
         if resp.clicked() {
-            *go_to = Some(path);
+            *go_to = Some(path.clone());
         }
     }
 }
@@ -521,12 +652,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_extensions_match_enabled_codecs() {
+    fn supported_extensions_and_save_name_normalization() {
         assert!(is_supported_extension("PNG"));
         assert!(is_supported_extension("jpeg"));
         assert!(is_supported_extension("Bmp"));
         assert!(!is_supported_extension("gif"));
         assert!(!is_supported_extension("webp"));
-        assert!(!is_supported_extension("tiff"));
+
+        assert_eq!(format_index_for_extension("jpeg"), Some(1));
+        assert_eq!(
+            normalize_save_name("photo.jpeg", "jpg").as_deref(),
+            Some("photo.jpeg")
+        );
+        assert_eq!(
+            normalize_save_name("photo.jpeg", "png").as_deref(),
+            Some("photo.png")
+        );
+        // Non-image suffixes such as `.v2` are preserved rather than truncated.
+        assert_eq!(
+            normalize_save_name("poster.v2", "png").as_deref(),
+            Some("poster.v2.png")
+        );
+        assert_eq!(normalize_save_name("   ", "png"), None);
     }
 }

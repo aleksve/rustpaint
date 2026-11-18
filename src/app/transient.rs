@@ -1,53 +1,62 @@
 //! State that belongs to an in-progress editing gesture.
 
-use eframe::egui::Rect;
+use eframe::egui::{Pos2, Rect};
 
 use crate::app::Btn;
 use crate::ir::IRect;
-use crate::paint::{Clip, Floating, Session, TextSession};
+use crate::paint::{Session, SessionKind};
 
 /// Editing state that is transient with respect to the current document.
-///
-/// The clipboard intentionally survives document replacement, matching the old
-/// application behavior. `reset_gesture` clears only work that is currently in
-/// flight; callers decide separately whether a marquee selection should stay.
 #[derive(Default)]
 pub(crate) struct EditState {
     pub(crate) session: Option<Session>,
-    pub(crate) floating: Option<Floating>,
-    pub(crate) clipboard: Option<Clip>,
-    pub(crate) text: Option<TextSession>,
-    pub(crate) polygon: Vec<(f32, f32)>,
     pub(crate) selection: Option<IRect>,
     pub(crate) select_drag_start: Option<(i32, i32)>,
     pub(crate) move_float_origin: Option<(i32, i32)>,
     pub(crate) text_editor_rect: Option<Rect>,
     pub(crate) dragging: Option<Btn>,
+    /// Last `(pointer_pos, shift)` processed during a drag, avoiding redundant
+    /// re-rasterisation and texture uploads when the pointer is stationary.
+    pub(crate) last_drag_input: Option<(Pos2, bool)>,
+    /// Last hover position used to preview an open polygon.
+    pub(crate) last_polygon_hover: Option<Pos2>,
 }
 
 impl EditState {
-    /// Clear a gesture without discarding the clipboard or marquee selection.
+    /// Clear any active gesture without discarding a committed marquee selection.
     pub(crate) fn reset_gesture(&mut self) {
         self.session = None;
-        self.floating = None;
-        self.text = None;
-        self.polygon.clear();
         self.select_drag_start = None;
         self.move_float_origin = None;
         self.text_editor_rect = None;
         self.dragging = None;
+        self.last_drag_input = None;
+        self.last_polygon_hover = None;
     }
 
-    /// Whether an edit still needs to be committed or cancelled.
-    pub(crate) fn has_in_progress_edit(&self) -> bool {
-        self.session.is_some()
-            || self.floating.is_some()
-            || self.text.is_some()
-            || !self.polygon.is_empty()
+    pub(crate) fn is_floating(&self) -> bool {
+        matches!(
+            self.session.as_ref().map(|s| &s.kind),
+            Some(SessionKind::Move { .. })
+        )
+    }
+
+    pub(crate) fn is_editing_text(&self) -> bool {
+        matches!(
+            self.session.as_ref().map(|s| &s.kind),
+            Some(SessionKind::Text { .. })
+        )
+    }
+
+    pub(crate) fn is_drawing_polygon(&self) -> bool {
+        matches!(
+            self.session.as_ref().map(|s| &s.kind),
+            Some(SessionKind::Polygon { pts, .. }) if !pts.is_empty()
+        )
     }
 
     /// Whether there is a marquee or a floating selection to act on.
     pub(crate) fn has_selection(&self) -> bool {
-        self.selection.is_some() || self.floating.is_some()
+        self.selection.is_some() || self.is_floating()
     }
 }

@@ -1,15 +1,20 @@
 //! Modern light / dark theming built on top of egui's `Visuals`.
 
-use eframe::egui::{self, Color32, FontFamily, FontId, Margin, Rounding, Stroke, TextStyle, Vec2};
+use std::sync::Arc;
+
+use eframe::egui::{
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
+    TextStyle, Vec2,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode {
+pub(crate) enum Mode {
     Dark,
     Light,
 }
 
 #[derive(Clone, Copy)]
-pub struct Theme {
+pub(crate) struct Theme {
     pub mode: Mode,
     pub panel: Color32,
     pub panel_alt: Color32,
@@ -69,6 +74,20 @@ impl Theme {
         matches!(self.mode, Mode::Dark)
     }
 
+    pub fn checker_colors(&self) -> (Color32, Color32) {
+        if self.is_dark() {
+            (
+                Color32::from_rgb(0x2a, 0x2d, 0x33),
+                Color32::from_rgb(0x32, 0x36, 0x3d),
+            )
+        } else {
+            (
+                Color32::from_rgb(0xe4, 0xe7, 0xec),
+                Color32::from_rgb(0xf3, 0xf5, 0xf8),
+            )
+        }
+    }
+
     pub fn visuals(&self) -> egui::Visuals {
         let mut v = if self.is_dark() {
             egui::Visuals::dark()
@@ -84,18 +103,18 @@ impl Theme {
         };
         v.faint_bg_color = self.panel_alt;
         v.override_text_color = Some(self.text);
-        v.window_rounding = Rounding::same(14.0);
-        v.menu_rounding = Rounding::same(10.0);
+        v.window_corner_radius = CornerRadius::same(14);
+        v.menu_corner_radius = CornerRadius::same(10);
         v.window_shadow = egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 10.0),
-            blur: 30.0,
-            spread: 0.0,
+            offset: [0, 10],
+            blur: 30,
+            spread: 0,
             color: self.shadow,
         };
         v.popup_shadow = egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 6.0),
-            blur: 18.0,
-            spread: 0.0,
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
             color: self.shadow,
         };
         v.selection.bg_fill = self.accent_soft;
@@ -107,56 +126,67 @@ impl Theme {
         w.noninteractive.weak_bg_fill = self.panel_alt;
         w.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
         w.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.text_dim);
-        w.noninteractive.rounding = Rounding::same(8.0);
+        w.noninteractive.corner_radius = CornerRadius::same(8);
 
         w.inactive.bg_fill = self.raised;
         w.inactive.weak_bg_fill = self.panel_alt;
         w.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
         w.inactive.fg_stroke = Stroke::new(1.0_f32, self.text);
-        w.inactive.rounding = Rounding::same(8.0);
+        w.inactive.corner_radius = CornerRadius::same(8);
         w.inactive.expansion = 0.0;
 
         w.hovered.bg_fill = self.hover;
         w.hovered.weak_bg_fill = self.hover;
         w.hovered.bg_stroke = Stroke::new(1.0_f32, self.border);
         w.hovered.fg_stroke = Stroke::new(1.0_f32, self.text);
-        w.hovered.rounding = Rounding::same(8.0);
+        w.hovered.corner_radius = CornerRadius::same(8);
         w.hovered.expansion = 0.0;
 
         w.active.bg_fill = self.accent;
         w.active.weak_bg_fill = self.accent;
         w.active.bg_stroke = Stroke::new(1.0_f32, self.accent);
         w.active.fg_stroke = Stroke::new(1.0_f32, self.on_accent);
-        w.active.rounding = Rounding::same(8.0);
+        w.active.corner_radius = CornerRadius::same(8);
 
         w.open.bg_fill = self.raised;
         w.open.weak_bg_fill = self.raised;
         w.open.bg_stroke = Stroke::new(1.0_f32, self.border);
         w.open.fg_stroke = Stroke::new(1.0_f32, self.text);
-        w.open.rounding = Rounding::same(8.0);
+        w.open.corner_radius = CornerRadius::same(8);
         v
     }
 }
 
-pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
+/// Wire the bundled Inter and DejaVu Sans faces into both `Proportional` and
+/// `Monospace` so `eframe`'s `default_fonts` feature is not needed.
+pub(crate) fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::empty();
     fonts.font_data.insert(
-        "ui".to_owned(),
-        egui::FontData::from_static(crate::assets::UI_FONT),
+        "inter".to_owned(),
+        Arc::new(FontData::from_static(crate::assets::UI_FONT)),
     );
-    if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
-        list.insert(0, "ui".to_owned());
-    }
+    fonts.font_data.insert(
+        "dejavu".to_owned(),
+        Arc::new(FontData::from_static(crate::assets::FALLBACK_FONT)),
+    );
+    fonts.families.insert(
+        FontFamily::Proportional,
+        vec!["inter".to_owned(), "dejavu".to_owned()],
+    );
+    fonts.families.insert(
+        FontFamily::Monospace,
+        vec!["inter".to_owned(), "dejavu".to_owned()],
+    );
     ctx.set_fonts(fonts);
 }
 
-pub fn apply(ctx: &egui::Context, t: &Theme) {
-    let mut style = (*ctx.style()).clone();
+pub(crate) fn apply(ctx: &egui::Context, t: &Theme) {
+    let mut style = (*ctx.global_style()).clone();
     style.visuals = t.visuals();
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(10.0, 6.0);
-    style.spacing.menu_margin = Margin::same(6.0);
-    style.spacing.window_margin = Margin::same(12.0);
+    style.spacing.menu_margin = Margin::same(6);
+    style.spacing.window_margin = Margin::same(12);
     style.spacing.interact_size = Vec2::new(32.0, 26.0);
     style.spacing.indent = 16.0;
     let prop = FontFamily::Proportional;
@@ -164,7 +194,7 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
         (TextStyle::Small, FontId::new(11.0, prop.clone())),
         (TextStyle::Body, FontId::new(13.0, prop.clone())),
         (TextStyle::Button, FontId::new(13.0, prop.clone())),
-        (TextStyle::Heading, FontId::new(17.0, prop.clone())),
+        (TextStyle::Heading, FontId::new(17.0, prop)),
         (
             TextStyle::Monospace,
             FontId::new(12.0, FontFamily::Monospace),
@@ -172,5 +202,22 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
     ]
     .into_iter()
     .collect();
-    ctx.set_style(style);
+    ctx.set_global_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_ui_fonts_layout_symbols_and_monospace_without_default_fonts() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply(&ctx, &Theme::dark());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label("RustPaint • Ctrl ⇧ Z · 1280 × 800 — ✓ … ⠿");
+            ui.monospace("#1A1C22");
+        });
+        out.textures_delta.clear();
+    }
 }

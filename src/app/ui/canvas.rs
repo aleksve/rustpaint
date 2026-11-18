@@ -1,334 +1,443 @@
-//! Canvas rendering, pointer interaction, and texture synchronization.
+//! Central canvas: single-quad checkerboard, GPU texture upload, input, overlays.
 
 use eframe::egui::{
-    self, Color32, Context, Key, Pos2, Rect, Rounding, Sense, Stroke, TextureOptions, Ui, Vec2,
+    self, Color32, CornerRadius, CursorIcon, Key, PointerButton, Pos2, Rect, Sense, Stroke,
+    StrokeKind, TextureFilter, TextureOptions, TextureWrapMode, Vec2,
 };
 
-use super::super::{App, Btn};
+use crate::app::{App, Btn};
 use crate::icons;
+use crate::paint::TexDirty;
 use crate::tools::Tool;
 use crate::widgets;
 
 impl App {
-    // --------------------------------------------------------------- canvas
-
-    pub(crate) fn canvas_ui(&mut self, ui: &mut Ui) {
+    pub(crate) fn canvas(&mut self, ui: &mut egui::Ui) {
         let th = self.theme;
-        let rect = ui.available_rect_before_wrap();
-        self.last_view_rect = rect;
-        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-        let painter = ui.painter().with_clip_rect(rect);
+        let dark = th.is_dark();
+        let blocked = self.modal_open();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(th.canvas_bg))
+            .show(ui, |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                self.last_view_rect = rect;
 
-        painter.rect_filled(rect, Rounding::ZERO, th.canvas_bg);
+                if self.view.fit_pending && rect.width() > 32.0 && rect.height() > 32.0 {
+                    self.fit_view(rect);
+                    self.view.fit_pending = false;
+                }
 
-        if self.view.fit_pending {
-            self.fit_view(rect);
-            self.view.fit_pending = false;
-        }
+                // Scroll to pan; Ctrl/Cmd + scroll or trackpad pinch to zoom at cursor.
+                if response.hovered() && !blocked {
+                    let (scroll, pinch, command) =
+                        ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.command));
+                    if (pinch - 1.0).abs() > 0.001 {
+                        let new_zoom = (self.view.zoom * pinch).clamp(0.05, 32.0);
+                        self.zoom_at(new_zoom, response.hover_pos(), rect);
+                    } else if command && scroll.y.abs() > 0.0 {
+                        let factor = (scroll.y * 0.004).exp();
+                        let new_zoom = (self.view.zoom * factor).clamp(0.05, 32.0);
+                        self.zoom_at(new_zoom, response.hover_pos(), rect);
+                    } else if scroll != Vec2::ZERO {
+                        self.view.pan += scroll;
+                    }
+                }
 
-        let zoom = self.view.zoom;
-        self.scale = zoom;
-        let size = Vec2::new(self.doc.w as f32, self.doc.h as f32) * zoom;
-        let origin = rect.center() - size * 0.5 + self.view.pan;
-        self.origin = origin;
-        let canvas_rect = Rect::from_min_size(origin, size);
+                let zoom = self.view.zoom;
+                let canvas_size = Vec2::new(self.doc.w as f32, self.doc.h as f32) * zoom;
+                let origin = rect.center() - canvas_size * 0.5 + self.view.pan;
+                self.origin = origin;
+                let canvas_rect = Rect::from_min_size(origin, canvas_size);
+                let visible = canvas_rect.intersect(rect);
 
-        if !self.modal_open() {
-            self.canvas_input(ui, &resp, rect, canvas_rect);
-        }
+                let painter = ui.painter().with_clip_rect(rect);
 
-        self.ensure_texture(ui.ctx());
-
-        painter.rect_filled(
-            canvas_rect.expand(8.0),
-            Rounding::same(6.0),
-            Color32::from_black_alpha(if th.is_dark() { 110 } else { 34 }),
-        );
-        let (checker_a, checker_b) = if th.is_dark() {
-            (
-                Color32::from_rgb(0x2a, 0x2d, 0x33),
-                Color32::from_rgb(0x32, 0x36, 0x3d),
-            )
-        } else {
-            (
-                Color32::from_rgb(0xe4, 0xe7, 0xec),
-                Color32::from_rgb(0xf3, 0xf5, 0xf8),
-            )
-        };
-        widgets::checkerboard(&painter, canvas_rect, 8.0, checker_a, checker_b);
-        if let Some(texture) = &self.tex {
-            painter.image(
-                texture.id(),
-                canvas_rect,
-                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-        painter.rect_stroke(canvas_rect, Rounding::ZERO, Stroke::new(1.0_f32, th.border));
-
-        if self.view.grid && zoom >= 6.0 {
-            let grid_color = Color32::from_black_alpha(if th.is_dark() { 70 } else { 40 });
-            let x0 = (((rect.left() - origin.x) / zoom).ceil()).max(0.0) as i32;
-            let x1 = (((rect.right() - origin.x) / zoom).floor()).min(self.doc.w as f32) as i32;
-            for i in x0..=x1 {
-                let x = origin.x + i as f32 * zoom;
-                painter.line_segment(
-                    [
-                        Pos2::new(x, canvas_rect.top()),
-                        Pos2::new(x, canvas_rect.bottom()),
-                    ],
-                    Stroke::new(1.0_f32, grid_color),
+                // Subtle drop shadow behind the canvas.
+                painter.rect_filled(
+                    canvas_rect.expand(4.0).translate(Vec2::new(0.0, 5.0)),
+                    CornerRadius::ZERO,
+                    Color32::from_black_alpha(if dark { 95 } else { 32 }),
                 );
-            }
-            let y0 = (((rect.top() - origin.y) / zoom).ceil()).max(0.0) as i32;
-            let y1 = (((rect.bottom() - origin.y) / zoom).floor()).min(self.doc.h as f32) as i32;
-            for i in y0..=y1 {
-                let y = origin.y + i as f32 * zoom;
-                painter.line_segment(
-                    [
-                        Pos2::new(canvas_rect.left(), y),
-                        Pos2::new(canvas_rect.right(), y),
-                    ],
-                    Stroke::new(1.0_f32, grid_color),
+                painter.rect_filled(
+                    canvas_rect.expand(1.0),
+                    CornerRadius::ZERO,
+                    Color32::from_black_alpha(if dark { 55 } else { 18 }),
                 );
-            }
-        }
 
-        if let Some(selection) = self.edit.selection {
-            let selection = selection.clamp(self.doc.w as i32, self.doc.h as i32);
-            if !selection.is_empty() {
-                let selection_rect = Rect::from_min_max(
-                    self.image_to_screen(Pos2::new(selection.x0 as f32, selection.y0 as f32)),
-                    self.image_to_screen(Pos2::new(selection.x1 as f32, selection.y1 as f32)),
-                );
-                let time = ui.ctx().input(|i| i.time) as f32 * 28.0;
-                icons::marching_ants(&painter, selection_rect, time, th.is_dark());
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(60));
-            }
-        }
-
-        if !self.edit.polygon.is_empty() {
-            let points: Vec<Pos2> = self
-                .edit
-                .polygon
-                .iter()
-                .map(|p| self.image_to_screen(Pos2::new(p.0, p.1)))
-                .collect();
-            painter.add(egui::Shape::line(
-                points.clone(),
-                Stroke::new(1.5_f32, th.accent),
-            ));
-            if let Some(hover) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-                if let Some(last) = points.last() {
-                    painter.line_segment(
-                        [*last, hover],
-                        Stroke::new(1.0_f32, th.accent.gamma_multiply(0.6)),
+                // Hardware-repeated 2×2 checkerboard texture (single quad regardless of
+                // canvas size or zoom level).
+                let checker_id = self.ensure_checker_texture(ui.ctx());
+                if visible.is_positive() {
+                    let period = 24.0;
+                    let u0 = (visible.min.x - canvas_rect.min.x) / period;
+                    let v0 = (visible.min.y - canvas_rect.min.y) / period;
+                    let u1 = (visible.max.x - canvas_rect.min.x) / period;
+                    let v1 = (visible.max.y - canvas_rect.min.y) / period;
+                    painter.image(
+                        checker_id,
+                        visible,
+                        Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1)),
+                        Color32::WHITE,
                     );
                 }
-            }
-            for point in &points {
-                painter.circle_filled(*point, 3.0, th.accent);
-            }
-        }
 
-        if let Some(hover) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-            if rect.contains(hover) && self.edit.session.is_none() && self.tool.uses_size() {
-                let radius = (self.opts.size * 0.5 * zoom).clamp(2.0, 3000.0);
-                painter.circle_stroke(
-                    hover,
-                    radius,
-                    Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
+                // Keep the GPU texture in sync with the document and zoom filter.
+                let want_nearest = zoom >= 1.0;
+                let texture_options = if want_nearest {
+                    TextureOptions::NEAREST
+                } else {
+                    TextureOptions::LINEAR
+                };
+                if self.tex.is_some() && self.tex_nearest != want_nearest {
+                    self.tex_dirty.mark_all();
+                }
+                self.tex_nearest = want_nearest;
+                match std::mem::replace(&mut self.tex_dirty, TexDirty::Clean) {
+                    TexDirty::Clean => {
+                        if self.tex.is_none() {
+                            let image = self.doc.to_color_image();
+                            self.tex =
+                                Some(ui.ctx().load_texture("canvas", image, texture_options));
+                        }
+                    }
+                    TexDirty::Full => {
+                        let image = self.doc.to_color_image();
+                        match &mut self.tex {
+                            Some(texture) => texture.set(image, texture_options),
+                            None => {
+                                self.tex =
+                                    Some(ui.ctx().load_texture("canvas", image, texture_options));
+                            }
+                        }
+                    }
+                    TexDirty::Rect(dirty_rect) => {
+                        let clipped = dirty_rect.clamp(self.doc.w as i32, self.doc.h as i32);
+                        match &mut self.tex {
+                            Some(texture)
+                                if texture.size() == [self.doc.w, self.doc.h]
+                                    && !clipped.is_empty() =>
+                            {
+                                let patch = self.doc.rect_color_image(clipped);
+                                let offset = [clipped.x0 as usize, clipped.y0 as usize];
+                                texture.set_partial(offset, patch, texture_options);
+                            }
+                            _ => {
+                                let image = self.doc.to_color_image();
+                                self.tex =
+                                    Some(ui.ctx().load_texture("canvas", image, texture_options));
+                            }
+                        }
+                    }
+                }
+
+                if let Some(texture) = &self.tex
+                    && visible.is_positive()
+                {
+                    painter.image(
+                        texture.id(),
+                        canvas_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+
+                // Viewport-clipped pixel grid at high zoom.
+                if self.view.grid && zoom >= 8.0 && visible.is_positive() {
+                    let grid_color =
+                        Color32::from_rgba_unmultiplied(128, 128, 140, if dark { 45 } else { 55 });
+                    let stroke = Stroke::new(1.0_f32, grid_color);
+                    let x0 = (((visible.min.x - canvas_rect.min.x) / zoom).ceil() as usize).max(1);
+                    let x1 = (((visible.max.x - canvas_rect.min.x) / zoom).floor() as usize)
+                        .min(self.doc.w.saturating_sub(1));
+                    if x0 <= x1 {
+                        for x in x0..=x1 {
+                            let sx = canvas_rect.min.x + x as f32 * zoom;
+                            painter.line_segment(
+                                [Pos2::new(sx, visible.min.y), Pos2::new(sx, visible.max.y)],
+                                stroke,
+                            );
+                        }
+                    }
+                    let y0 = (((visible.min.y - canvas_rect.min.y) / zoom).ceil() as usize).max(1);
+                    let y1 = (((visible.max.y - canvas_rect.min.y) / zoom).floor() as usize)
+                        .min(self.doc.h.saturating_sub(1));
+                    if y0 <= y1 {
+                        for y in y0..=y1 {
+                            let sy = canvas_rect.min.y + y as f32 * zoom;
+                            painter.line_segment(
+                                [Pos2::new(visible.min.x, sy), Pos2::new(visible.max.x, sy)],
+                                stroke,
+                            );
+                        }
+                    }
+                }
+
+                // Crisp border around the canvas.
+                painter.rect_stroke(
+                    canvas_rect,
+                    CornerRadius::ZERO,
+                    Stroke::new(1.0_f32, th.border),
+                    StrokeKind::Outside,
                 );
-                painter.circle_stroke(
-                    hover,
-                    radius + 1.0,
-                    Stroke::new(1.0_f32, Color32::from_white_alpha(160)),
-                );
-            }
-        }
+
+                // Marching ants around an active selection (clipped to viewport via `painter`).
+                if let Some(selection) = self.edit.selection
+                    && !selection.is_empty()
+                {
+                    let selection_rect = Rect::from_min_max(
+                        origin + Vec2::new(selection.x0 as f32, selection.y0 as f32) * zoom,
+                        origin + Vec2::new(selection.x1 as f32, selection.y1 as f32) * zoom,
+                    );
+                    let phase = (ui.input(|i| i.time) * 14.0) as f32;
+                    icons::marching_ants(&painter, selection_rect, phase, dark);
+                    // Low-frequency animation timer (~16 Hz) only while ants are visible.
+                    ui.ctx().request_repaint_after_secs(0.06);
+                }
+
+                // Polygon construction vertices.
+                let poly_pts = self.polygon_points();
+                if !poly_pts.is_empty() {
+                    for &(px, py) in poly_pts {
+                        let screen_point = origin + Vec2::new(px, py) * zoom;
+                        painter.circle_filled(screen_point, 4.0, th.on_accent);
+                        painter.circle_stroke(screen_point, 4.0, Stroke::new(1.6_f32, th.accent));
+                    }
+                }
+
+                self.cursor_img = response.hover_pos().map(|pos| {
+                    let image_pos = self.screen_to_image(pos);
+                    (image_pos.x.floor() as i32, image_pos.y.floor() as i32)
+                });
+
+                self.handle_canvas_input(ui, &response, blocked);
+
+                // Brush preview circle under the cursor.
+                if !blocked
+                    && response.hovered()
+                    && !self.space_pan
+                    && self.tool.uses_size()
+                    && !self.tool.is_shape()
+                    && self.tool != Tool::Polygon
+                    && let Some(pos) = response.hover_pos()
+                {
+                    let radius = (self.opts.size * 0.5 * zoom).max(1.5);
+                    painter.circle_stroke(
+                        pos,
+                        radius + 0.8,
+                        Stroke::new(1.0_f32, Color32::from_black_alpha(150)),
+                    );
+                    painter.circle_stroke(
+                        pos,
+                        radius,
+                        Stroke::new(1.0_f32, Color32::from_white_alpha(210)),
+                    );
+                }
+            });
     }
 
-    pub(crate) fn canvas_input(
-        &mut self,
-        ui: &mut Ui,
-        response: &egui::Response,
-        view_rect: Rect,
-        canvas: Rect,
-    ) {
-        let ctx = ui.ctx().clone();
+    fn ensure_checker_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        let dark = self.theme.is_dark();
+        let opts = TextureOptions {
+            magnification: TextureFilter::Nearest,
+            minification: TextureFilter::Nearest,
+            wrap_mode: TextureWrapMode::Repeat,
+            mipmap_mode: None,
+        };
+        if let Some((cached_dark, ref handle)) = self.checker_tex
+            && cached_dark == dark
+        {
+            return handle.id();
+        }
+        let (a, b) = self.theme.checker_colors();
+        let img = widgets::checker_texture_image(a, b);
+        let handle = match self.checker_tex.take() {
+            Some((_, mut h)) => {
+                h.set(img, opts);
+                h
+            }
+            None => ctx.load_texture("checker", img, opts),
+        };
+        let id = handle.id();
+        self.checker_tex = Some((dark, handle));
+        id
+    }
+
+    fn handle_canvas_input(&mut self, ui: &mut egui::Ui, response: &egui::Response, blocked: bool) {
+        if blocked {
+            if self.edit.dragging.take().is_some() {
+                self.pointer_release();
+            }
+            return;
+        }
+
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let space = !typing && ui.input(|i| i.key_down(Key::Space));
+        self.space_pan = space;
+
         let (
-            hover,
-            scroll,
-            modifiers,
+            pointer,
             primary_down,
             secondary_down,
             middle_down,
             primary_pressed,
             secondary_pressed,
-            primary_released,
-            secondary_released,
-            space,
-        ) = ctx.input(|i| {
+            shift,
+            alt,
+            delta,
+            dt,
+        ) = ui.input(|i| {
             (
-                i.pointer.hover_pos(),
-                i.raw_scroll_delta,
-                i.modifiers,
-                i.pointer.primary_down(),
-                i.pointer.secondary_down(),
-                i.pointer.button_down(egui::PointerButton::Middle),
-                i.pointer.button_pressed(egui::PointerButton::Primary),
-                i.pointer.button_pressed(egui::PointerButton::Secondary),
-                i.pointer.button_released(egui::PointerButton::Primary),
-                i.pointer.button_released(egui::PointerButton::Secondary),
-                i.key_down(Key::Space),
+                i.pointer.interact_pos(),
+                i.pointer.button_down(PointerButton::Primary),
+                i.pointer.button_down(PointerButton::Secondary),
+                i.pointer.button_down(PointerButton::Middle),
+                i.pointer.button_pressed(PointerButton::Primary),
+                i.pointer.button_pressed(PointerButton::Secondary),
+                i.modifiers.shift,
+                i.modifiers.alt,
+                i.pointer.delta(),
+                i.unstable_dt,
             )
         });
-        let hovered = response.hovered();
-        let canvas_hovered = hover.is_some_and(|point| canvas.contains(point));
-        let text_editor_hovered = hover.is_some_and(|point| {
-            let editor_hovered = self
-                .edit
-                .text_editor_rect
-                .is_some_and(|editor| editor.contains(point));
-            let text_hovered = self.text_hit_rect().is_some_and(|text| {
-                let image = self.screen_to_image(point);
-                text.contains(image.x.floor() as i32, image.y.floor() as i32)
-            });
-            editor_hovered || text_hovered
-        });
 
-        if hovered && scroll != Vec2::ZERO {
-            if modifiers.ctrl || modifiers.command {
-                let anchor = hover.unwrap_or(view_rect.center());
-                let factor = (scroll.y * 0.0016).exp();
-                self.zoom_at(self.view.zoom * factor, Some(anchor), view_rect);
-            } else if modifiers.shift {
-                self.view.pan.x += scroll.y;
-            } else {
-                self.view.pan += scroll;
-            }
-        }
-        let pinch = ctx.input(|i| i.zoom_delta());
-        if hovered && (pinch - 1.0).abs() > 1e-4 {
-            self.zoom_at(self.view.zoom * pinch, hover, view_rect);
-        }
-
-        if let Some(hover) = hover {
-            if canvas.contains(hover) {
-                let image = self.screen_to_image(hover);
-                self.cursor_img = Some((image.x.floor() as i32, image.y.floor() as i32));
-            } else {
-                self.cursor_img = None;
-            }
-        }
-
-        let pan_mode = space || self.tool == Tool::Pan || middle_down;
-        if pan_mode && (primary_down || middle_down) {
-            self.view.pan += ctx.input(|i| i.pointer.delta());
-            if hovered {
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            }
-            return;
-        }
-
-        if canvas_hovered {
-            ctx.set_cursor_icon(match self.tool {
-                Tool::Text => egui::CursorIcon::Text,
-                Tool::Pan => egui::CursorIcon::Grab,
-                _ => egui::CursorIcon::Crosshair,
-            });
-        }
-
-        if canvas_hovered && self.edit.dragging.is_none() && !text_editor_hovered {
-            if primary_pressed {
-                if let Some(hover) = hover {
-                    self.edit.dragging = Some(Btn::Primary);
-                    self.pointer_press(Btn::Primary, hover, modifiers.shift, modifiers.alt);
+        let panning = self.tool == Tool::Pan || space || middle_down;
+        if response.hovered() {
+            let over_text = self.edit.is_editing_text()
+                && pointer.is_some_and(|p| {
+                    let img = self.screen_to_image(p);
+                    self.text_hit_rect()
+                        .is_some_and(|r| r.contains(img.x.floor() as i32, img.y.floor() as i32))
+                });
+            let over_float_or_sel = self.tool == Tool::Select
+                && !shift
+                && pointer.is_some_and(|p| {
+                    let img = self.screen_to_image(p);
+                    self.edit
+                        .selection
+                        .is_some_and(|r| r.contains(img.x.floor() as i32, img.y.floor() as i32))
+                });
+            let icon = if panning {
+                if primary_down || middle_down {
+                    CursorIcon::Grabbing
+                } else {
+                    CursorIcon::Grab
                 }
-            } else if secondary_pressed {
-                if let Some(hover) = hover {
-                    self.edit.dragging = Some(Btn::Secondary);
-                    self.pointer_press(Btn::Secondary, hover, modifiers.shift, modifiers.alt);
+            } else if over_text || over_float_or_sel {
+                if primary_down {
+                    CursorIcon::Grabbing
+                } else {
+                    CursorIcon::Move
                 }
-            }
+            } else if self.tool == Tool::Text {
+                CursorIcon::Text
+            } else {
+                CursorIcon::Crosshair
+            };
+            ui.ctx().set_cursor_icon(icon);
         }
 
+        // Always honour button release before pan short-circuit so pressing Space
+        // mid-stroke cannot leave `self.edit.dragging` stranded.
         if let Some(button) = self.edit.dragging {
-            if let Some(hover) = hover {
-                if self.tool == Tool::Select
-                    && self.edit.select_drag_start.is_some()
-                    && self.edit.session.is_none()
-                {
-                    self.drag_select(self.screen_to_image(hover), modifiers.shift);
-                } else if primary_down || secondary_down {
-                    self.pointer_move(hover, modifiers.shift);
-                }
-            }
-            let released = (button == Btn::Primary && primary_released)
-                || (button == Btn::Secondary && secondary_released);
-            if released {
-                self.pointer_release();
+            let still_down = match button {
+                Btn::Primary => primary_down,
+                Btn::Secondary => secondary_down,
+            };
+            if !still_down {
+                self.edit.dragging = None;
                 self.edit.select_drag_start = None;
                 self.edit.move_float_origin = None;
-                self.edit.dragging = None;
+                self.edit.last_drag_input = None;
+                self.pointer_release();
             }
         }
 
-        if self.tool == Tool::Polygon
-            && !self.edit.polygon.is_empty()
-            && self.edit.session.is_some()
-            && self.edit.dragging.is_none()
-        {
-            if let Some(hover) = hover {
-                self.update_polygon_preview(self.screen_to_image(hover));
+        if panning {
+            if (response.dragged() || (response.hovered() && (primary_down || middle_down)))
+                && delta != Vec2::ZERO
+            {
+                self.view.pan += delta;
             }
-        }
-
-        if canvas_hovered && self.tool == Tool::Polygon && response.double_clicked() {
-            self.finish_polygon();
-        }
-
-        if self.tool == Tool::Airbrush && self.edit.session.is_some() {
-            ctx.request_repaint();
-        }
-    }
-
-    pub(crate) fn ensure_texture(&mut self, ctx: &Context) {
-        use crate::paint::TexDirty;
-
-        let nearest = self.view.zoom >= 1.0;
-        let sampling_changed = nearest != self.tex_nearest;
-        if self.tex_dirty == TexDirty::Clean && !sampling_changed && self.tex.is_some() {
             return;
         }
-        let options = if nearest {
-            TextureOptions::NEAREST
-        } else {
-            TextureOptions::LINEAR
-        };
-        let partial = match self.tex_dirty {
-            TexDirty::Rect(rect) if !sampling_changed && self.tex.is_some() => {
-                Some(rect.clamp(self.doc.w as i32, self.doc.h as i32))
-            }
-            _ => None,
-        };
 
-        if let Some(rect) = partial {
-            if !rect.is_empty() {
-                let image = self.doc.rect_color_image(rect);
-                if let Some(texture) = self.tex.as_mut() {
-                    texture.set_partial([rect.x0 as usize, rect.y0 as usize], image, options);
-                }
+        // Polygon tool finishes on double-click or right-click.
+        if self.tool == Tool::Polygon && self.edit.is_drawing_polygon() {
+            if response.double_clicked() || (response.hovered() && secondary_pressed) {
+                self.finish_polygon();
+                return;
             }
-        } else {
-            let image = self.doc.to_color_image();
-            match &mut self.tex {
-                Some(texture) => texture.set(image, options),
-                None => self.tex = Some(ctx.load_texture("canvas", image, options)),
+            if let Some(pos) = response.hover_pos()
+                && self.edit.last_polygon_hover != Some(pos)
+            {
+                self.edit.last_polygon_hover = Some(pos);
+                let img = self.screen_to_image(pos);
+                self.update_polygon_preview(img);
             }
         }
-        self.tex_nearest = nearest;
-        self.tex_dirty = TexDirty::Clean;
+
+        // Ignore clicks that land on the floating text bar/editor itself.
+        let over_editor = pointer.is_some_and(|point| {
+            self.edit
+                .text_editor_rect
+                .is_some_and(|editor| editor.contains(point))
+        });
+
+        // Allow dragging painted text directly on the canvas too.
+        if self.edit.is_editing_text() && !over_editor {
+            if response.drag_started_by(PointerButton::Primary)
+                && let Some(pos) = pointer
+            {
+                let img = self.screen_to_image(pos);
+                if self
+                    .text_hit_rect()
+                    .is_some_and(|r| r.contains(img.x.floor() as i32, img.y.floor() as i32))
+                {
+                    self.edit.dragging = Some(Btn::Primary);
+                }
+            }
+            if self.edit.dragging == Some(Btn::Primary) {
+                if delta != Vec2::ZERO {
+                    self.move_text_by(delta);
+                }
+                return;
+            }
+        }
+
+        if response.hovered() && !over_editor && self.edit.dragging.is_none() {
+            let pressed_button = if primary_pressed {
+                Some(Btn::Primary)
+            } else if secondary_pressed {
+                Some(Btn::Secondary)
+            } else {
+                None
+            };
+            if let (Some(button), Some(pos)) = (pressed_button, pointer) {
+                self.edit.dragging = Some(button);
+                self.edit.last_drag_input = Some((pos, shift));
+                self.pointer_press(button, pos, shift, alt);
+            }
+        }
+
+        if self.edit.dragging.is_some()
+            && let Some(pos) = pointer
+        {
+            let input_changed = self.edit.last_drag_input != Some((pos, shift));
+            let continuous_spray = self.tool == Tool::Airbrush;
+            if self.tool == Tool::Select && self.edit.select_drag_start.is_some() {
+                if input_changed {
+                    self.edit.last_drag_input = Some((pos, shift));
+                    let image_pos = self.screen_to_image(pos);
+                    self.drag_select(image_pos, shift);
+                }
+            } else if input_changed || continuous_spray {
+                self.edit.last_drag_input = Some((pos, shift));
+                self.pointer_move(pos, shift, dt);
+                if continuous_spray {
+                    ui.ctx().request_repaint_after_secs(1.0 / 60.0);
+                }
+            }
+        }
     }
 }

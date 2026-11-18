@@ -1,13 +1,13 @@
 //! Modal dialogs and their small state transitions.
 
-use eframe::egui::{self, Context, Sense, Vec2};
+use eframe::egui::{self, Context, Key, Sense, Vec2};
 
 use super::{App, Dialog, Pending};
 use crate::icons::{self, Icon};
-use crate::widgets;
+use crate::widgets::{self, ButtonKind};
 
 impl App {
-    pub(crate) fn show_dialogs(&mut self, ctx: &Context) {
+    pub(crate) fn show_dialogs(&mut self, ctx: &Context, frame: Option<&eframe::Frame>) {
         let th = self.theme;
         let Some(dialog) = self.dialog.clone() else {
             return;
@@ -18,7 +18,7 @@ impl App {
             Dialog::Resize => self.resize_dialog(ctx, th),
             Dialog::About => self.about_dialog(ctx, th),
             Dialog::Shortcuts => self.shortcuts_dialog(ctx, th),
-            Dialog::Discard(pending) => self.discard_dialog(ctx, th, pending),
+            Dialog::Discard(pending) => self.discard_dialog(ctx, th, pending, frame),
         }
     }
 
@@ -63,27 +63,30 @@ impl App {
             let megapixels = (width as f64 * height as f64) / 1_000_000.0;
             let dimension_error =
                 crate::doc::validate_dimensions(width as usize, height as usize).err();
-            let invalid = dimension_error.is_some();
+            let valid = dimension_error.is_none();
             ui.label(
-                egui::RichText::new(if invalid {
-                    format!(
-                        "{width} × {height} · {megapixels:.1} MP — {}, pick something smaller",
-                        dimension_error.expect("error exists")
-                    )
-                } else {
-                    format!(
+                egui::RichText::new(match dimension_error {
+                    Some(err) => {
+                        format!("{width} × {height} · {megapixels:.1} MP — {err}, pick smaller")
+                    }
+                    None => format!(
                         "{width} × {height} · {megapixels:.1} MP · about {:.0} MB in memory",
                         megapixels * 4.0
-                    )
+                    ),
                 })
                 .size(10.5)
-                .color(if invalid { th.danger } else { th.text_dim }),
+                .color(if valid { th.text_dim } else { th.danger }),
             );
             ui.add_space(6.0);
             widgets::toggle(ui, &th, &mut transparent, "Transparent background");
             ui.add_space(10.0);
+            let enter =
+                !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(Key::Enter));
             dialog_actions(ui, |ui| {
-                if widgets::button(ui, &th, "Create", !invalid).clicked() && !invalid {
+                if (widgets::button_styled(ui, &th, "Create", ButtonKind::Primary, valid).clicked()
+                    || enter)
+                    && valid
+                {
                     create = true;
                 }
                 if widgets::button(ui, &th, "Cancel", false).clicked() {
@@ -124,6 +127,7 @@ impl App {
             ui.add_space(6.0);
             let dimension_error =
                 crate::doc::validate_dimensions(width as usize, height as usize).err();
+            let valid = dimension_error.is_none();
             if let Some(error) = &dimension_error {
                 ui.label(
                     egui::RichText::new(error.to_string())
@@ -135,17 +139,20 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(if scale {
-                    "The artwork is resampled to the new size."
+                    "The artwork is resampled proportionally and centred in the new size."
                 } else {
-                    "The canvas is cropped / extended; pixels keep their size."
+                    "The canvas is cropped / extended; existing pixels keep their size."
                 })
                 .size(10.5)
                 .color(th.text_dim),
             );
             ui.add_space(10.0);
+            let enter =
+                !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(Key::Enter));
             dialog_actions(ui, |ui| {
-                if widgets::button(ui, &th, "Apply", dimension_error.is_none()).clicked()
-                    && dimension_error.is_none()
+                if (widgets::button_styled(ui, &th, "Apply", ButtonKind::Primary, valid).clicked()
+                    || enter)
+                    && valid
                 {
                     apply = true;
                 }
@@ -170,7 +177,7 @@ impl App {
 
     fn about_dialog(&mut self, ctx: &Context, th: crate::theme::Theme) {
         let mut close = false;
-        widgets::modal(ctx, &th, "about", Vec2::new(440.0, 300.0), |ui| {
+        widgets::modal(ctx, &th, "about", Vec2::new(450.0, 310.0), |ui| {
             if widgets::modal_header(ui, &th, "About RustPaint") {
                 close = true;
             }
@@ -180,9 +187,12 @@ impl App {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("RustPaint").size(18.0).strong());
                     ui.label(
-                        egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                            .size(11.5)
-                            .color(th.text_dim),
+                        egui::RichText::new(format!(
+                            "Version {} · GPL-3.0-or-later",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(11.5)
+                        .color(th.text_dim),
                     );
                 });
             });
@@ -198,9 +208,9 @@ impl App {
             ui.add_space(8.0);
             for line in [
                 "• Layers: single canvas, straight-alpha RGBA",
-                "• GPU accelerated rendering via wgpu/glow",
-                "• Undo history is diff based and memory capped",
-                "• Fonts and icons are embedded — no runtime assets",
+                "• GPU-accelerated rendering via OpenGL (glow)",
+                "• Tiled stroke masks & memory-capped undo/redo history",
+                "• Native file dialogs, system image clipboard, and embedded fonts",
             ] {
                 ui.label(egui::RichText::new(line).size(11.5).color(th.text_dim));
             }
@@ -225,7 +235,7 @@ impl App {
             egui::ScrollArea::vertical()
                 .max_height(360.0)
                 .show(ui, |ui| {
-                    let rows: [(&str, &str); 28] = [
+                    let rows: [(&str, &str); 29] = [
                         ("Tools", ""),
                         ("Select / Brush / Pencil", "V / B / P"),
                         ("Eraser / Airbrush / Fill", "E / A / G"),
@@ -235,7 +245,7 @@ impl App {
                         ("Brush size", "[ and ]"),
                         ("Swap / reset colours", "X / D"),
                         ("Editing", ""),
-                        ("Undo / Redo", "Ctrl Z / Ctrl ⇧ Z"),
+                        ("Undo / Redo", "Ctrl Z / Ctrl ⇧ Z or Ctrl Y"),
                         ("Cut / Copy / Paste", "Ctrl X / C / V"),
                         ("Delete selection", "Del"),
                         ("Select all / Deselect", "Ctrl A / Ctrl D"),
@@ -246,14 +256,15 @@ impl App {
                         ("New / Open / Save", "Ctrl N / O / S"),
                         ("Save as", "Ctrl ⇧ S"),
                         ("Canvas size", "Ctrl E"),
-                        ("View", ""),
+                        ("View & Help", ""),
                         ("Zoom in / out", "Ctrl + / Ctrl -"),
                         ("Actual size / Fit", "Ctrl 0 / Ctrl 9"),
                         ("Pan view", "Space-drag or wheel"),
                         ("Zoom at cursor", "Ctrl + wheel"),
-                        ("Pixel grid", "toolbar button"),
+                        ("Pixel grid", "Ctrl '"),
                         ("Pick colour mid-stroke", "Alt + click"),
                         ("Draw with secondary colour", "Right-drag"),
+                        ("Keyboard shortcuts", "F1"),
                     ];
                     for (label, shortcut) in rows {
                         if shortcut.is_empty() {
@@ -292,11 +303,17 @@ impl App {
         }
     }
 
-    fn discard_dialog(&mut self, ctx: &Context, th: crate::theme::Theme, pending: Pending) {
+    fn discard_dialog(
+        &mut self,
+        ctx: &Context,
+        th: crate::theme::Theme,
+        pending: Pending,
+        frame: Option<&eframe::Frame>,
+    ) {
         let mut close = false;
         let mut discard = false;
         let mut save_first = false;
-        widgets::modal(ctx, &th, "discard", Vec2::new(430.0, 200.0), |ui| {
+        widgets::modal(ctx, &th, "discard", Vec2::new(440.0, 200.0), |ui| {
             if widgets::modal_header(ui, &th, "Unsaved changes") {
                 close = true;
             }
@@ -310,17 +327,17 @@ impl App {
             );
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Do you want to continue without saving?")
+                egui::RichText::new("Save your changes before continuing?")
                     .size(11.5)
                     .color(th.text_dim),
             );
             ui.add_space(14.0);
             dialog_actions(ui, |ui| {
-                if widgets::button(ui, &th, "Discard", true).clicked() {
-                    discard = true;
-                }
-                if widgets::button(ui, &th, "Save first", false).clicked() {
+                if widgets::button(ui, &th, "Save first", true).clicked() {
                     save_first = true;
+                }
+                if widgets::button_styled(ui, &th, "Discard", ButtonKind::Danger, true).clicked() {
+                    discard = true;
                 }
                 if widgets::button(ui, &th, "Cancel", false).clicked() {
                     close = true;
@@ -328,14 +345,15 @@ impl App {
             });
         });
         if close {
-            self.dialog = None;
+            self.cancel_dialogs();
         } else if save_first {
             self.dialog = None;
             self.pending_after_save = Some(pending);
-            self.save_dialog(ctx);
+            self.quick_save(ctx, frame);
         } else if discard {
             self.dialog = None;
-            self.resume_pending(pending, ctx);
+            self.pending_after_save = None;
+            self.resume_pending(pending, ctx, frame);
         }
     }
 }

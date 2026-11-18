@@ -1,19 +1,20 @@
 [package]
 name = "rustpaint"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.92"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
 description = "A modern, cross-platform Paint clone written in Rust (Windows, macOS, Linux)"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 keywords = ["paint", "drawing", "egui", "graphics", "cross-platform"]
 categories = ["graphics", "gui"]
 
 [dependencies]
 # Windowing + immediate mode GUI. `glow` = OpenGL backend (works everywhere,
-# including software rendering / remote desktops).
-eframe = { version = "0.29.1", default-features = false, features = [
-    "default_fonts",
+# including software rendering / remote desktops). `default_fonts` is omitted
+# because RustPaint embeds Inter and DejaVu Sans directly.
+eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",
     "glow",
     "wayland",
     "x11",
@@ -29,6 +30,8 @@ fontdb = { version = "0.24", default-features = false, features = ["fs", "memmap
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 # Native "Open / Save" panels (IFileDialog on Windows, NSOpenPanel on macOS).
 rfd = "0.18"
+# Native OS image clipboard (PNG/DIB on Windows, NSPasteboard on macOS).
+arboard = "3.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Replace an existing file atomically after encoding a temporary sibling.
@@ -38,6 +41,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 # On Linux rfd talks to the XDG desktop portal over D-Bus. The built-in file
 # browser is used automatically when no portal is available.
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+# Native OS image clipboard across both X11 and Wayland data-control compositors.
+arboard = { version = "3.7", features = ["wayland-data-control"] }
 
 [profile.release]
 opt-level = 3

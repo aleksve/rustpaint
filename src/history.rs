@@ -1,29 +1,63 @@
-//! Diff based undo / redo.
+//! Diff-based undo / redo with support for canvas dimension changes.
 //!
-//! Only the bounding box of the changed pixels is stored, so a two pixel
-//! pencil dab costs a handful of bytes while a full canvas fill costs two
-//! copies of the canvas.  Total memory is capped and the oldest entries are
-//! dropped first.
+//! Normal painting edits store only the tight bounding box of modified pixels,
+//! while dimension-changing operations (crop, resize, 90° rotation) store the
+//! before/after frames so users never lose undo history. Total memory is capped
+//! in O(1) using a `VecDeque` and a running byte counter, and monotonic state
+//! IDs accurately track whether the document matches its last saved state.
 
+use std::collections::VecDeque;
+
+use crate::doc::Doc;
 use crate::ir::IRect;
 
-pub struct Diff {
-    pub rect: IRect,
-    pub before: Vec<u8>,
-    pub after: Vec<u8>,
+enum Entry {
+    Diff {
+        rect: IRect,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    },
+    Resize {
+        before_w: usize,
+        before_h: usize,
+        before: Vec<u8>,
+        after_w: usize,
+        after_h: usize,
+        after: Vec<u8>,
+    },
 }
 
-impl Diff {
+impl Entry {
     fn bytes(&self) -> usize {
-        self.before.len() + self.after.len()
+        match self {
+            Entry::Diff { before, after, .. } | Entry::Resize { before, after, .. } => {
+                before.len() + after.len()
+            }
+        }
     }
 }
 
-pub struct History {
-    undo: Vec<Diff>,
-    redo: Vec<Diff>,
+struct Step {
+    before_state: u64,
+    after_state: u64,
+    entry: Entry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppliedChange {
+    Region(IRect),
+    Resized,
+}
+
+pub(crate) struct History {
+    undo: VecDeque<Step>,
+    redo: VecDeque<Step>,
+    total_bytes: usize,
     limit: usize,
     max_bytes: usize,
+    next_state: u64,
+    current_state: u64,
+    saved_state: Option<u64>,
 }
 
 impl Default for History {
@@ -35,16 +69,35 @@ impl Default for History {
 impl History {
     pub fn new(limit: usize, max_bytes: usize) -> Self {
         Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            total_bytes: 0,
             limit,
             max_bytes,
+            next_state: 1,
+            current_state: 0,
+            saved_state: Some(0),
         }
     }
 
-    pub fn clear(&mut self) {
+    /// Clear all history and mark the fresh document state as clean (saved).
+    pub fn reset_clean(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.total_bytes = 0;
+        let s = self.alloc_state();
+        self.current_state = s;
+        self.saved_state = Some(s);
+    }
+
+    /// Mark the current history point as matching the file on disk.
+    pub fn mark_saved(&mut self) {
+        self.saved_state = Some(self.current_state);
+    }
+
+    /// Whether the document differs from the last clean/saved state.
+    pub fn is_modified(&self) -> bool {
+        self.saved_state != Some(self.current_state)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -59,35 +112,60 @@ impl History {
         self.undo.len()
     }
 
-    pub fn redo_len(&self) -> usize {
-        self.redo.len()
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 
-    fn total_bytes(&self) -> usize {
-        self.undo
-            .iter()
-            .chain(self.redo.iter())
-            .map(|d| d.bytes())
-            .sum()
+    fn alloc_state(&mut self) -> u64 {
+        let s = self.next_state;
+        self.next_state = self.next_state.wrapping_add(1);
+        s
+    }
+
+    fn clear_redo(&mut self) {
+        for step in self.redo.drain(..) {
+            self.total_bytes = self.total_bytes.saturating_sub(step.entry.bytes());
+        }
     }
 
     fn trim(&mut self) {
         while self.undo.len() > self.limit {
-            self.undo.remove(0);
+            if let Some(removed) = self.undo.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.entry.bytes());
+            }
         }
-        while self.total_bytes() > self.max_bytes && self.undo.len() > 1 {
-            self.undo.remove(0);
+        while self.total_bytes > self.max_bytes && self.undo.len() > 1 {
+            if let Some(removed) = self.undo.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.entry.bytes());
+            }
         }
-        while self.total_bytes() > self.max_bytes
+        // In `redo`, the front holds the oldest redo step (furthest from current)
+        // and the back holds the immediate next redo step.
+        while self.total_bytes > self.max_bytes
             && !self.redo.is_empty()
             && (!self.undo.is_empty() || self.redo.len() > 1)
         {
-            self.redo.remove(0);
+            if let Some(removed) = self.redo.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.entry.bytes());
+            }
         }
     }
 
+    fn push_entry(&mut self, entry: Entry) {
+        self.clear_redo();
+        let before_state = self.current_state;
+        let after_state = self.alloc_state();
+        self.current_state = after_state;
+        self.total_bytes = self.total_bytes.saturating_add(entry.bytes());
+        self.undo.push_back(Step {
+            before_state,
+            after_state,
+            entry,
+        });
+        self.trim();
+    }
+
     /// Record a change described by the full "before" and "after" buffers.
-    /// Returns the changed rectangle, or `None` when nothing actually changed.
     pub fn record(&mut self, before: &[u8], after: &[u8], w: usize, h: usize) -> Option<IRect> {
         self.record_region(before, after, w, h, IRect::new(0, 0, w as i32, h as i32))
     }
@@ -111,9 +189,8 @@ impl History {
         )
     }
 
-    /// Record a change when the before buffer contains only `before_rect`.
-    /// The after buffer remains a full-canvas image, so local painting sessions
-    /// do not need to retain a second full-canvas snapshot for undo history.
+    /// Record a change when `before` covers only `before_rect` while `after` is
+    /// the full canvas buffer.
     pub fn record_local(
         &mut self,
         before: &[u8],
@@ -124,6 +201,33 @@ impl History {
         region: IRect,
     ) -> Option<IRect> {
         self.record_with_rects(before, before_rect, after, w, h, region)
+    }
+
+    /// Record a canvas-resizing operation (crop, resize, 90° rotation).
+    pub fn record_resize(
+        &mut self,
+        before_w: usize,
+        before_h: usize,
+        before: Vec<u8>,
+        after_w: usize,
+        after_h: usize,
+        after: &[u8],
+    ) -> bool {
+        if before_w == after_w && before_h == after_h && before.as_slice() == after {
+            return false;
+        }
+        if before_w == after_w && before_h == after_h {
+            return self.record(&before, after, after_w, after_h).is_some();
+        }
+        self.push_entry(Entry::Resize {
+            before_w,
+            before_h,
+            before,
+            after_w,
+            after_h,
+            after: after.to_vec(),
+        });
+        true
     }
 
     fn record_with_rects(
@@ -153,32 +257,40 @@ impl History {
             return None;
         }
         let before_w = before_rect.w() as usize;
+        let span_w = region.w() as usize;
+        let span_bytes = span_w * 4;
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
         let mut max_y = i32::MIN;
+
         for y in region.y0..region.y1 {
-            let before_row = (y - before_rect.y0) as usize * before_w * 4;
-            let after_row = y as usize * w * 4;
-            for x in region.x0..region.x1 {
-                let before_i = before_row + (x - before_rect.x0) as usize * 4;
-                let after_i = after_row + x as usize * 4;
-                if before[before_i..before_i + 4] != after[after_i..after_i + 4] {
-                    if x < min_x {
-                        min_x = x;
-                    }
-                    if x > max_x {
-                        max_x = x;
-                    }
-                    if y < min_y {
-                        min_y = y;
-                    }
-                    if y > max_y {
-                        max_y = y;
-                    }
-                }
+            let b_start = ((y - before_rect.y0) as usize * before_w
+                + (region.x0 - before_rect.x0) as usize)
+                * 4;
+            let a_start = (y as usize * w + region.x0 as usize) * 4;
+            let b_slice = &before[b_start..b_start + span_bytes];
+            let a_slice = &after[a_start..a_start + span_bytes];
+            // Vectorised memcmp skips untouched scanlines immediately.
+            if b_slice == a_slice {
+                continue;
             }
+            let b_px = b_slice.as_chunks::<4>().0;
+            let a_px = a_slice.as_chunks::<4>().0;
+            let Some(first) = b_px.iter().zip(a_px.iter()).position(|(bp, ap)| bp != ap) else {
+                continue;
+            };
+            let last = b_px
+                .iter()
+                .zip(a_px.iter())
+                .rposition(|(bp, ap)| bp != ap)
+                .unwrap_or(first);
+            min_x = min_x.min(region.x0 + first as i32);
+            max_x = max_x.max(region.x0 + last as i32);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
         }
+
         if min_x > max_x {
             return None;
         }
@@ -189,6 +301,7 @@ impl History {
             y1: max_y + 1,
         };
         let (rw, rh) = (rect.w() as usize, rect.h() as usize);
+        let row_bytes = rw * 4;
         let mut b = Vec::with_capacity(rw * rh * 4);
         let mut a = Vec::with_capacity(rw * rh * 4);
         for y in rect.y0..rect.y1 {
@@ -196,81 +309,135 @@ impl History {
                 + (rect.x0 - before_rect.x0) as usize)
                 * 4;
             let after_start = (y as usize * w + rect.x0 as usize) * 4;
-            b.extend_from_slice(&before[before_start..before_start + rw * 4]);
-            a.extend_from_slice(&after[after_start..after_start + rw * 4]);
+            b.extend_from_slice(&before[before_start..before_start + row_bytes]);
+            a.extend_from_slice(&after[after_start..after_start + row_bytes]);
         }
-        self.undo.push(Diff {
+        self.push_entry(Entry::Diff {
             rect,
             before: b,
             after: a,
         });
-        self.redo.clear();
-        self.trim();
         Some(rect)
     }
 
-    fn apply(px: &mut [u8], w: usize, d: &Diff, use_after: bool) {
-        let data = if use_after { &d.after } else { &d.before };
-        let rw = d.rect.w().max(0) as usize;
-        for (row, y) in (d.rect.y0..d.rect.y1).enumerate() {
-            let start = ((y as usize) * w + d.rect.x0 as usize) * 4;
-            let end = start + rw * 4;
-            let src = row * rw * 4;
-            if end <= px.len() && src + rw * 4 <= data.len() {
-                px[start..end].copy_from_slice(&data[src..src + rw * 4]);
+    fn apply_diff(px: &mut [u8], w: usize, rect: IRect, data: &[u8]) {
+        let rw = rect.w() as usize;
+        let row_bytes = rw * 4;
+        for (row, y) in (rect.y0..rect.y1).enumerate() {
+            let start = (y as usize * w + rect.x0 as usize) * 4;
+            let end = start + row_bytes;
+            let src = row * row_bytes;
+            if end <= px.len() && src + row_bytes <= data.len() {
+                px[start..end].copy_from_slice(&data[src..src + row_bytes]);
             }
         }
     }
 
-    pub fn undo(&mut self, px: &mut [u8], w: usize) -> Option<IRect> {
-        let d = self.undo.pop()?;
-        History::apply(px, w, &d, false);
-        let rect = d.rect;
-        self.redo.push(d);
+    pub fn undo_doc(&mut self, doc: &mut Doc) -> Option<AppliedChange> {
+        let step = self.undo.pop_back()?;
+        let change = match &step.entry {
+            Entry::Diff { rect, before, .. } => {
+                Self::apply_diff(&mut doc.px, doc.w, *rect, before);
+                AppliedChange::Region(*rect)
+            }
+            Entry::Resize {
+                before_w,
+                before_h,
+                before,
+                ..
+            } => {
+                doc.w = *before_w;
+                doc.h = *before_h;
+                doc.px.clone_from(before);
+                AppliedChange::Resized
+            }
+        };
+        self.current_state = step.before_state;
+        doc.modified = self.is_modified();
+        self.redo.push_back(step);
         self.trim();
-        Some(rect)
+        Some(change)
     }
 
-    pub fn redo(&mut self, px: &mut [u8], w: usize) -> Option<IRect> {
-        let d = self.redo.pop()?;
-        History::apply(px, w, &d, true);
-        let rect = d.rect;
-        self.undo.push(d);
+    pub fn redo_doc(&mut self, doc: &mut Doc) -> Option<AppliedChange> {
+        let step = self.redo.pop_back()?;
+        let change = match &step.entry {
+            Entry::Diff { rect, after, .. } => {
+                Self::apply_diff(&mut doc.px, doc.w, *rect, after);
+                AppliedChange::Region(*rect)
+            }
+            Entry::Resize {
+                after_w,
+                after_h,
+                after,
+                ..
+            } => {
+                doc.w = *after_w;
+                doc.h = *after_h;
+                doc.px.clone_from(after);
+                AppliedChange::Resized
+            }
+        };
+        self.current_state = step.after_state;
+        doc.modified = self.is_modified();
+        self.undo.push_back(step);
         self.trim();
-        Some(rect)
+        Some(change)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui::Color32;
 
     #[test]
-    fn undo_roundtrip() {
-        let w = 4;
-        let h = 4;
-        let before = vec![0u8; w * h * 4];
-        let mut after = before.clone();
-        after[(w + 2) * 4] = 9;
-        let mut hist = History::default();
-        let r = hist.record(&before, &after, w, h).unwrap();
-        assert_eq!(
-            r,
-            IRect {
-                x0: 2,
-                y0: 1,
-                x1: 3,
-                y1: 2
-            }
-        );
+    fn undo_roundtrip_and_saved_state_tracking() {
+        let mut doc = Doc::new(4, 4, None).unwrap();
+        let before = doc.px.clone();
+        doc.px[(doc.w + 2) * 4] = 9;
+        let after = doc.px.clone();
 
-        let mut buf = after.clone();
-        assert!(hist.undo(&mut buf, w).is_some());
-        assert_eq!(buf, before);
-        assert!(hist.redo(&mut buf, w).is_some());
-        assert_eq!(buf, after);
-        assert!(hist.undo(&mut buf, w).is_some());
+        let mut hist = History::default();
+        assert!(!hist.is_modified());
+        let r = hist.record(&before, &after, doc.w, doc.h).unwrap();
+        assert_eq!(r, IRect::px(2, 1));
+        assert!(hist.is_modified());
+
+        // Undoing back to the initial clean state clears `modified`.
+        assert_eq!(hist.undo_doc(&mut doc), Some(AppliedChange::Region(r)));
+        assert_eq!(doc.px, before);
+        assert!(!doc.modified);
+
+        // Redoing marks it modified again; saving clears it; undoing marks modified.
+        assert_eq!(hist.redo_doc(&mut doc), Some(AppliedChange::Region(r)));
+        assert_eq!(doc.px, after);
+        assert!(doc.modified);
+        hist.mark_saved();
+        assert!(!hist.is_modified());
+        assert!(hist.undo_doc(&mut doc).is_some());
+        assert!(doc.modified);
         assert!(!hist.can_undo());
+    }
+
+    #[test]
+    fn resize_roundtrip_restores_dimensions_and_pixels() {
+        let mut doc = Doc::new(4, 3, Some(Color32::WHITE)).unwrap();
+        doc.set(1, 1, [200, 10, 20, 255]);
+        let before = doc.px.clone();
+        let (bw, bh) = (doc.w, doc.h);
+
+        doc.crop(IRect::new(1, 1, 3, 3));
+        let mut hist = History::default();
+        assert!(hist.record_resize(bw, bh, before.clone(), doc.w, doc.h, &doc.px));
+
+        assert_eq!(hist.undo_doc(&mut doc), Some(AppliedChange::Resized));
+        assert_eq!((doc.w, doc.h), (4, 3));
+        assert_eq!(doc.px, before);
+
+        assert_eq!(hist.redo_doc(&mut doc), Some(AppliedChange::Resized));
+        assert_eq!((doc.w, doc.h), (2, 2));
+        assert_eq!(doc.get(0, 0), Some([200, 10, 20, 255]));
     }
 
     #[test]
@@ -283,73 +450,75 @@ mod tests {
 
     #[test]
     fn region_record_scans_only_the_supplied_area() {
-        let w = 4;
-        let h = 4;
-        let before = vec![0u8; w * h * 4];
-        let mut after = before.clone();
-        after[0] = 9;
-        after[(2 * w + 3) * 4] = 7;
+        let mut doc = Doc::new(4, 4, None).unwrap();
+        let before = doc.px.clone();
+        doc.px[0] = 9;
+        doc.px[(2 * doc.w + 3) * 4] = 7;
         let mut hist = History::default();
-        assert!(hist
-            .record_region(&before, &after, w, h, IRect::new(2, 1, 4, 4))
-            .is_some());
-        let mut buf = after;
-        hist.undo(&mut buf, w);
-        assert_eq!(buf[(2 * w + 3) * 4], 0);
-        assert_eq!(buf[0], 9);
+        assert!(
+            hist.record_region(&before, &doc.px, doc.w, doc.h, IRect::new(2, 1, 4, 4))
+                .is_some()
+        );
+        hist.undo_doc(&mut doc);
+        assert_eq!(doc.px[(2 * 4 + 3) * 4], 0);
+        assert_eq!(doc.px[0], 9);
     }
 
     #[test]
     fn local_record_roundtrips_against_full_canvas() {
-        let w = 5;
-        let h = 4;
+        let mut doc = Doc::new(5, 4, None).unwrap();
         let base_rect = IRect::new(1, 1, 4, 3);
         let mut before = vec![0u8; base_rect.w() as usize * base_rect.h() as usize * 4];
         before[(base_rect.w() as usize + 1) * 4] = 3;
 
-        let mut after = vec![0u8; w * h * 4];
         for y in base_rect.y0..base_rect.y1 {
-            let before_start = ((y - base_rect.y0) as usize * base_rect.w() as usize) * 4;
-            let after_start = (y as usize * w + base_rect.x0 as usize) * 4;
+            let b_start = (y - base_rect.y0) as usize * base_rect.w() as usize * 4;
+            let a_start = (y as usize * doc.w + base_rect.x0 as usize) * 4;
             let row_len = base_rect.w() as usize * 4;
-            after[after_start..after_start + row_len]
-                .copy_from_slice(&before[before_start..before_start + row_len]);
+            doc.px[a_start..a_start + row_len].copy_from_slice(&before[b_start..b_start + row_len]);
         }
-        let changed = ((2 * w) + 2) * 4;
-        after[changed] = 9;
-        after[4] = 7;
+        let changed = (2 * doc.w + 2) * 4;
+        doc.px[changed] = 9;
+        doc.px[4] = 7;
 
         let mut hist = History::default();
         assert_eq!(
-            hist.record_local(&before, base_rect, &after, w, h, base_rect),
+            hist.record_local(&before, base_rect, &doc.px, doc.w, doc.h, base_rect),
             Some(IRect::px(2, 2))
         );
 
-        let mut canvas = after.clone();
-        assert!(hist.undo(&mut canvas, w).is_some());
-        assert_eq!(canvas[changed], 3);
-        assert_eq!(canvas[4], 7);
-        assert!(hist.redo(&mut canvas, w).is_some());
-        assert_eq!(canvas[changed], 9);
-        assert_eq!(canvas[4], 7);
+        assert!(hist.undo_doc(&mut doc).is_some());
+        assert_eq!(doc.px[changed], 3);
+        assert_eq!(doc.px[4], 7);
+        assert!(hist.redo_doc(&mut doc).is_some());
+        assert_eq!(doc.px[changed], 9);
+        assert_eq!(doc.px[4], 7);
     }
 
     #[test]
-    fn memory_cap_includes_redo_entries() {
-        let before = vec![0u8; 4];
-        let mut first = before.clone();
-        first[0] = 1;
-        let mut second = first.clone();
-        second[0] = 2;
+    fn memory_cap_includes_redo_entries_and_preserves_immediate_redo() {
+        let mut doc = Doc::new(1, 1, None).unwrap();
+        let s0 = doc.px.clone();
+        doc.px[0] = 1;
+        let s1 = doc.px.clone();
+        doc.px[0] = 2;
+        let s2 = doc.px.clone();
+        doc.px[0] = 3;
 
-        let mut hist = History::new(10, 16);
-        hist.record(&before, &first, 1, 1);
-        hist.record(&first, &second, 1, 1);
-        assert!(hist.undo(&mut second.clone(), 1).is_some());
+        let mut hist = History::new(10, 24);
+        hist.record(&s0, &s1, 1, 1);
+        hist.record(&s1, &s2, 1, 1);
+        hist.record(&s2, &doc.px, 1, 1);
+        // Undo twice so redo holds two entries (s1->s2 is immediate, s2->s3 is oldest).
+        assert!(hist.undo_doc(&mut doc).is_some());
+        assert!(hist.undo_doc(&mut doc).is_some());
+        assert_eq!(doc.px[0], 1);
 
-        hist.max_bytes = 8;
-        let mut canvas = first;
-        assert!(hist.redo(&mut canvas, 1).is_some());
-        assert_eq!(hist.undo_len(), 1);
+        hist.max_bytes = 16;
+        hist.trim();
+        // Immediate redo step (1 -> 2) is kept; oldest redo step (2 -> 3) was dropped.
+        assert!(hist.redo_doc(&mut doc).is_some());
+        assert_eq!(doc.px[0], 2);
+        assert_eq!(hist.total_bytes, 16);
     }
 }

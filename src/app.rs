@@ -1,4 +1,20 @@
-//! Application shell: layout, menus, panels, canvas view, dialogs.
+//! Application state, frame lifecycle, and cross-cutting actions.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use eframe::egui::{self, Color32, Context, Pos2, Rect, TextureHandle, Vec2};
+
+use crate::clipboard::ImageClipboard;
+use crate::doc::Doc;
+use crate::filedlg::FileDialog;
+use crate::fonts::FontCatalog;
+use crate::history::History;
+use crate::paint::TexDirty;
+use crate::prefs::Prefs;
+use crate::text::TextEngine;
+use crate::theme::{self, Theme};
+use crate::tools::{Colors, Tool, ToolOptions, to_hex};
 
 mod dialogs;
 mod files;
@@ -7,36 +23,20 @@ mod shortcuts;
 mod transient;
 mod ui;
 
-use std::path::PathBuf;
+pub(crate) use files::write_bytes_atomically;
+pub(crate) use transient::EditState;
 
-use eframe::egui::{self, Color32, Context, Pos2, Rect, TextureHandle, Vec2};
-
-use crate::doc::Doc;
-use crate::filedlg::FileDialog;
-use crate::fonts::FontCatalog;
-use crate::history::History;
-use crate::prefs::Prefs;
-use crate::text::TextEngine;
-use crate::theme::{self, Theme};
-use crate::tools::{Colors, Tool, ToolOptions};
-
-use self::transient::EditState;
+const HISTORY_LIMIT: usize = 80;
+const HISTORY_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Btn {
+pub(crate) enum Btn {
     Primary,
     Secondary,
 }
 
-pub struct View {
-    pub zoom: f32,
-    pub pan: Vec2,
-    pub grid: bool,
-    pub fit_pending: bool,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Dialog {
+#[derive(Clone)]
+pub(crate) enum Dialog {
     New,
     Resize,
     About,
@@ -44,252 +44,315 @@ pub enum Dialog {
     Discard(Pending),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Pending {
+#[derive(Clone)]
+pub(crate) enum Pending {
     New,
     Open,
-    /// Open this file (drag & drop) once the current one is dealt with.
     OpenPath(PathBuf),
     Quit,
 }
 
+pub(crate) struct View {
+    pub zoom: f32,
+    pub pan: Vec2,
+    pub grid: bool,
+    pub fit_pending: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            grid: true,
+            fit_pending: true,
+        }
+    }
+}
+
 pub struct App {
-    pub doc: Doc,
-    pub hist: History,
-    pub tool: Tool,
-    pub opts: ToolOptions,
-    pub colors: Colors,
-    pub color_target: Btn,
-    pub theme: Theme,
-    pub view: View,
+    pub(crate) doc: Doc,
+    pub(crate) hist: History,
+    pub(crate) tool: Tool,
+    pub(crate) opts: ToolOptions,
+    pub(crate) colors: Colors,
+    pub(crate) color_target: Btn,
+    pub(crate) picker_hsv: (Color32, [f32; 3]),
+    pub(crate) hex_edit: String,
+    pub(crate) hex_focused: bool,
+    pub(crate) font_filter: String,
+    pub(crate) tool_sizes: HashMap<Tool, f32>,
 
-    pub edit: EditState,
+    pub(crate) view: View,
+    pub(crate) origin: Pos2,
+    pub(crate) last_view_rect: Rect,
+    pub(crate) tex: Option<TextureHandle>,
+    pub(crate) tex_nearest: bool,
+    pub(crate) checker_tex: Option<(bool, TextureHandle)>,
+    pub(crate) tex_dirty: TexDirty,
 
-    pub tex: Option<TextureHandle>,
-    pub tex_dirty: crate::paint::TexDirty,
-    pub tex_nearest: bool,
-    pub origin: Pos2,
-    pub scale: f32,
-    pub cursor_img: Option<(i32, i32)>,
-    pub text_engine: TextEngine,
-    pub fonts: FontCatalog,
-    /// Native OS file panels (rfd) instead of the built-in browser.
-    pub native_dialogs: bool,
-    pub font_search: String,
-    pub prefs: Prefs,
-    /// Per-tool brush sizes, so switching tools keeps each tool's own size.
-    pub tool_sizes: std::collections::HashMap<Tool, f32>,
+    pub(crate) edit: EditState,
+    pub(crate) space_pan: bool,
+    pub(crate) cursor_img: Option<(i32, i32)>,
+    pub(crate) picked_color: Option<Color32>,
 
-    pub file_dialog: Option<FileDialog>,
-    pub dialog: Option<Dialog>,
-    pub pending_after_save: Option<Pending>,
-    pub toast_msg: Option<(String, f64)>,
-    pub rng: u64,
-    pub picked_color: Option<Color32>,
-    pub last_view_rect: Rect,
-    pub title_cache: String,
-    pub hex_buf: String,
-    pub hex_edit_active: bool,
-    pub pending_clip_text: Option<String>,
+    pub(crate) clipboard: ImageClipboard,
+    pub(crate) text_engine: TextEngine,
+    pub(crate) fonts: FontCatalog,
+    pub(crate) rng: u64,
 
-    pub new_w: u32,
-    pub new_h: u32,
-    pub new_transparent: bool,
-    pub resize_w: u32,
-    pub resize_h: u32,
-    pub resize_scale: bool,
-    pub allow_close: bool,
+    pub(crate) prefs: Prefs,
+    pub(crate) theme: Theme,
+    pub(crate) dialog: Option<Dialog>,
+    pub(crate) file_dialog: Option<FileDialog>,
+    pub(crate) io_job: Option<files::ActiveIoJob>,
+    pub(crate) pending_after_save: Option<Pending>,
+    pub(crate) native_dialogs: bool,
+    pub(crate) new_w: u32,
+    pub(crate) new_h: u32,
+    pub(crate) new_transparent: bool,
+    pub(crate) resize_w: u32,
+    pub(crate) resize_h: u32,
+    pub(crate) resize_scale: bool,
+    pub(crate) toast_msg: Option<(String, f64)>,
+    pub(crate) allow_close: bool,
+    pub(crate) last_title: String,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
-        // Ctrl +/- and Ctrl+wheel zoom the *canvas*, not the whole UI.
-        cc.egui_ctx.options_mut(|o| {
-            o.zoom_with_keyboard = false;
-        });
         let prefs = Prefs::load();
-        let th = if prefs.theme_dark {
+        let theme = if prefs.theme_dark {
             Theme::dark()
         } else {
             Theme::light()
         };
-        theme::apply(&cc.egui_ctx, &th);
+        theme::apply(&cc.egui_ctx, &theme);
 
-        let fonts = FontCatalog::new();
-        let mut opts = ToolOptions {
-            size: 12.0,
-            ..Default::default()
-        };
-        if let Some(f) = &prefs.font_family {
-            if fonts.families().iter().any(|x| x == f) {
-                opts.font_family = f.clone();
-            }
+        let initial_file = std::env::args_os().nth(1).map(PathBuf::from);
+        let native_dialogs = prefs.native_dialogs.unwrap_or(crate::native::available());
+        let preferred_font = prefs.font_family.clone();
+        let mut app = Self::build(
+            1280,
+            800,
+            prefs,
+            theme,
+            FontCatalog::new_async(preferred_font),
+            ImageClipboard::new(),
+            native_dialogs,
+        );
+
+        if let Some(path) = initial_file {
+            app.start_open_file(path, &cc.egui_ctx);
         }
 
+        app
+    }
+
+    fn build(
+        w: usize,
+        h: usize,
+        prefs: Prefs,
+        theme: Theme,
+        fonts: FontCatalog,
+        clipboard: ImageClipboard,
+        native_dialogs: bool,
+    ) -> Self {
+        let colors = Colors::default();
+        let hex_edit = to_hex(colors.primary);
+        let hsva = egui::ecolor::Hsva::from_srgb([
+            colors.primary.r(),
+            colors.primary.g(),
+            colors.primary.b(),
+        ]);
+        let mut opts = ToolOptions::default();
+        if let Some(ref fam) = prefs.font_family
+            && fonts.families().iter().any(|f| f == fam)
+        {
+            opts.font_family = fam.clone();
+        }
+        let mut tool_sizes = HashMap::new();
+        for tool in Tool::ALL {
+            if tool.uses_size() {
+                tool_sizes.insert(tool, tool.default_size());
+            }
+        }
         Self {
-            doc: Doc::new(1280, 800, Some(Color32::WHITE))
-                .expect("default canvas dimensions are valid"),
-            hist: History::default(),
+            doc: Doc::new(w, h, Some(Color32::WHITE))
+                .expect("default canvas fits within validated limits"),
+            hist: History::new(HISTORY_LIMIT, HISTORY_MAX_BYTES),
             tool: Tool::Brush,
             opts,
-            colors: Colors::default(),
+            picker_hsv: (colors.primary, [hsva.h, hsva.s, hsva.v]),
+            colors,
             color_target: Btn::Primary,
-            theme: th,
-            view: View {
-                zoom: 1.0,
-                pan: Vec2::ZERO,
-                grid: false,
-                fit_pending: true,
-            },
-            edit: EditState::default(),
-            tex: None,
-            tex_dirty: crate::paint::TexDirty::Full,
-            tex_nearest: true,
+            hex_edit,
+            hex_focused: false,
+            font_filter: String::new(),
+            tool_sizes,
+            view: View::default(),
             origin: Pos2::ZERO,
-            scale: 1.0,
+            last_view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+            tex: None,
+            tex_nearest: true,
+            checker_tex: None,
+            tex_dirty: TexDirty::Full,
+            edit: EditState::default(),
+            space_pan: false,
             cursor_img: None,
+            picked_color: None,
+            clipboard,
             text_engine: TextEngine::new(),
             fonts,
-            native_dialogs: crate::native::available(),
-            font_search: String::new(),
+            rng: 0x9E37_79B9_7F4A_7C15,
             prefs,
-            tool_sizes: default_tool_sizes(),
-            file_dialog: None,
+            theme,
             dialog: None,
+            file_dialog: None,
+            io_job: None,
             pending_after_save: None,
-            toast_msg: None,
-            rng: 0x2545F4914F6CDD1D,
-            picked_color: None,
-            last_view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
-            title_cache: String::new(),
-            hex_buf: String::new(),
-            hex_edit_active: false,
-            pending_clip_text: None,
+            native_dialogs,
             new_w: 1280,
             new_h: 800,
             new_transparent: false,
-            resize_w: 1280,
-            resize_h: 800,
+            resize_w: w as u32,
+            resize_h: h as u32,
             resize_scale: false,
+            toast_msg: None,
             allow_close: false,
+            last_title: String::new(),
         }
     }
 
-    fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.file_dialog.is_some()
+    #[cfg(test)]
+    pub(crate) fn new_headless(w: usize, h: usize) -> Self {
+        Self::build(
+            w,
+            h,
+            Prefs::default(),
+            Theme::dark(),
+            FontCatalog::bundled_only(),
+            ImageClipboard::local_only(),
+            false,
+        )
     }
 
-    pub fn set_tool(&mut self, t: Tool) {
-        if self.tool == t {
+    pub(crate) fn set_tool(&mut self, tool: Tool) {
+        if self.tool == tool {
             return;
         }
-        self.commit_current();
-        // Remember the size this tool was last used with.
+        if self.edit.is_drawing_polygon() {
+            self.finish_polygon();
+        } else {
+            self.commit_current();
+        }
         if self.tool.uses_size() {
             self.tool_sizes.insert(self.tool, self.opts.size);
         }
-        self.tool = t;
-        if let Some(sz) = self.tool_sizes.get(&t) {
-            self.opts.size = *sz;
+        self.tool = tool;
+        if tool.uses_size() {
+            let max = tool.max_size();
+            let remembered = self
+                .tool_sizes
+                .get(&tool)
+                .copied()
+                .unwrap_or_else(|| tool.default_size());
+            self.opts.size = remembered.clamp(1.0, max);
         }
-        if t.uses_size() {
-            self.opts.size = self.opts.size.max(1.0);
+    }
+
+    pub(crate) fn open_resize_dialog(&mut self) {
+        self.resize_w = self.doc.w as u32;
+        self.resize_h = self.doc.h as u32;
+        self.dialog = Some(Dialog::Resize);
+    }
+
+    pub(crate) fn paste_with_toast(&mut self, ctx: &Context) {
+        if let Err(err) = self.paste() {
+            self.toast(ctx, format!("Paste failed: {err}"));
+        }
+    }
+
+    pub(crate) fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.file_dialog.is_some() || self.io_job.is_some()
+    }
+
+    pub(crate) fn theme_for_prefs(&self) -> Theme {
+        if self.prefs.theme_dark {
+            Theme::dark()
+        } else {
+            Theme::light()
+        }
+    }
+
+    fn update_title(&mut self, ctx: &Context) {
+        let dirty = if self.doc.modified { " •" } else { "" };
+        let title = format!("{}{} — RustPaint", self.doc.display_name(), dirty);
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+    }
+
+    fn handle_file_drop(&mut self, ctx: &Context) {
+        if self.modal_open() {
+            return;
+        }
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .find(|p| !p.as_os_str().is_empty())
+        });
+        if let Some(path) = dropped {
+            if self.doc.modified {
+                self.dialog = Some(Dialog::Discard(Pending::OpenPath(path)));
+            } else {
+                self.start_open_file(path, ctx);
+            }
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &Context) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        if requested && !self.allow_close && (self.doc.modified || self.io_job.is_some()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.io_job.is_none() {
+                self.dialog = Some(Dialog::Discard(Pending::Quit));
+            }
         }
     }
 }
 
 impl eframe::App for App {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.prefs.save();
-    }
-
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Cursor output is not reset by egui between frames. Start with the
-        // platform default, then let widgets and the canvas override it while
-        // they are actually hovered. This also covers modal frames, where
-        // canvas_input is intentionally skipped.
-        ctx.set_cursor_icon(egui::CursorIcon::Default);
-
-        // close request with unsaved changes
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && self.doc.modified && !self.allow_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::Discard(Pending::Quit));
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if let Some(preferred) = self.fonts.poll_ready()
+            && self.opts.font_family == crate::fonts::BUILTIN_INTER
+        {
+            self.opts.font_family = preferred;
         }
-
-        // A file dragged onto the window behaves like File ▸ Open.
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            if self.doc.modified {
-                self.dialog = Some(Dialog::Discard(Pending::OpenPath(path)));
-            } else {
-                self.read_file(path, ctx);
-            }
+        if self.fonts.is_loading() {
+            ctx.request_repaint_after_secs(0.15);
         }
+        self.poll_io_job(&ctx, Some(frame));
+        self.update_title(&ctx);
+        self.handle_close_request(&ctx);
+        self.handle_file_drop(&ctx);
+        shortcuts::handle(self, &ctx, Some(frame));
 
-        shortcuts::handle(self, ctx);
-        self.top_bar(ctx);
-        self.status_bar(ctx);
-        self.tool_rail(ctx);
-        self.side_panel(ctx);
+        self.top_bar(ui, Some(frame));
+        self.status_bar(ui);
+        self.tool_dock(ui);
+        self.right_panel(ui);
+        self.canvas(ui);
+        self.overlays(&ctx, Some(frame));
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(self.theme.canvas_bg))
-            .show(ctx, |ui| {
-                self.canvas_ui(ui);
-            });
-
-        self.overlays(ctx);
-
-        if let Some(text) = self.pending_clip_text.take() {
-            ctx.copy_text(text);
+        if let Some(color) = self.picked_color.take() {
+            self.hex_edit = to_hex(color);
         }
-
-        // window title
-        let title = format!(
-            "{}{} · RustPaint",
-            self.doc.display_name(),
-            if self.doc.modified { " •" } else { "" }
-        );
-        if title != self.title_cache {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.title_cache = title;
-        }
-
-        if self.edit.has_in_progress_edit() || self.toast_msg.is_some() {
-            ctx.request_repaint();
-        }
-    }
-}
-
-/// Sensible starting brush size per tool (remembered per tool afterwards).
-fn default_tool_sizes() -> std::collections::HashMap<Tool, f32> {
-    use Tool::*;
-    let mut m = std::collections::HashMap::new();
-    for (t, s) in [
-        (Pencil, 1.0),
-        (Brush, 12.0),
-        (Eraser, 24.0),
-        (Airbrush, 32.0),
-        (Line, 4.0),
-        (Rect, 4.0),
-        (Ellipse, 4.0),
-        (Polygon, 4.0),
-    ] {
-        m.insert(t, s);
-    }
-    m
-}
-
-/// Shorten a label for the narrow side panel.
-fn elide(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -297,262 +360,279 @@ fn elide(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::ir::IRect;
-    use crate::mask::Mask;
-    use crate::paint::{Clip, Floating, Kind, Session, TextSession};
-
-    fn test_app() -> App {
-        App {
-            doc: Doc::new(8, 6, Some(Color32::WHITE)).expect("test dimensions are valid"),
-            hist: History::default(),
-            tool: Tool::Brush,
-            opts: ToolOptions::default(),
-            colors: Colors::default(),
-            color_target: Btn::Primary,
-            theme: Theme::dark(),
-            view: View {
-                zoom: 1.0,
-                pan: Vec2::ZERO,
-                grid: false,
-                fit_pending: false,
-            },
-            edit: EditState::default(),
-            tex: None,
-            tex_dirty: crate::paint::TexDirty::Full,
-            tex_nearest: true,
-            origin: Pos2::ZERO,
-            scale: 1.0,
-            cursor_img: None,
-            text_engine: TextEngine::new(),
-            fonts: FontCatalog::new(),
-            native_dialogs: false,
-            font_search: String::new(),
-            prefs: Prefs::default(),
-            tool_sizes: default_tool_sizes(),
-            file_dialog: None,
-            dialog: None,
-            pending_after_save: None,
-            toast_msg: None,
-            rng: 0x2545F4914F6CDD1D,
-            picked_color: None,
-            last_view_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0)),
-            title_cache: String::new(),
-            hex_buf: String::new(),
-            hex_edit_active: false,
-            pending_clip_text: None,
-            new_w: 8,
-            new_h: 6,
-            new_transparent: false,
-            resize_w: 8,
-            resize_h: 6,
-            resize_scale: false,
-            allow_close: false,
-        }
-    }
-
-    fn paint_rect(app: &mut App, rect: IRect, color: Color32) {
-        let rgba = crate::doc::color_to_rgba(color);
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                app.doc.set(x, y, rgba);
-            }
-        }
-    }
-
-    fn assert_region_color(app: &App, rect: IRect, color: Color32) {
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                assert_eq!(app.doc.color_at(x, y), color, "pixel ({x}, {y})");
-            }
-        }
-    }
-
-    #[test]
-    fn tool_sizes_follow_the_selected_tool() {
-        let mut app = test_app();
-        app.opts.size = 19.0;
-        app.set_tool(Tool::Pencil);
-        app.opts.size = 3.0;
-
-        app.set_tool(Tool::Brush);
-
-        assert_eq!(app.opts.size, 19.0);
-        assert_eq!(app.tool_sizes.get(&Tool::Pencil), Some(&3.0));
-    }
+    use crate::paint::ImageOp;
 
     #[test]
     fn selection_clipboard_operations_round_trip_through_history() {
-        let mut app = test_app();
-        let selection = IRect::new(1, 1, 3, 3);
-        let red = Color32::from_rgb(220, 30, 40);
-        paint_rect(&mut app, selection, red);
-        let copied = app.doc.region(selection);
-        app.edit.selection = Some(selection);
+        let mut app = App::new_headless(8, 8);
+        app.doc.set(1, 1, [200, 10, 20, 255]);
+        app.doc.set(2, 1, [10, 200, 20, 255]);
+        app.edit.selection = Some(IRect::new(1, 1, 3, 2));
 
         app.cut_selection();
+        assert_eq!(app.doc.get(1, 1), Some([0, 0, 0, 0]));
+        assert_eq!(app.doc.get(2, 1), Some([0, 0, 0, 0]));
+        assert!(app.doc.modified);
 
-        assert_eq!(
-            app.edit.clipboard.as_ref().map(|clip| clip.px.clone()),
-            Some(copied.clone())
-        );
-        assert_region_color(&app, selection, Color32::TRANSPARENT);
+        assert!(app.paste().unwrap());
+        assert!(app.edit.is_floating());
+        app.commit_current();
+
+        assert_eq!(app.doc.get(3, 3), Some([200, 10, 20, 255]));
+        assert_eq!(app.doc.get(4, 3), Some([10, 200, 20, 255]));
 
         app.undo();
-        assert_region_color(&app, selection, red);
-        app.redo();
+        assert_eq!(app.doc.get(3, 3), Some([255, 255, 255, 255]));
+        assert!(app.doc.modified);
 
-        app.paste();
-        let pasted = app.edit.selection.expect("paste creates a selection");
-        assert!(app.edit.floating.is_some());
-        app.commit_current();
-        assert_eq!(app.doc.region(pasted), copied);
-
-        app.delete_selection();
-        assert_region_color(&app, pasted, Color32::TRANSPARENT);
+        app.undo();
+        assert_eq!(app.doc.get(1, 1), Some([200, 10, 20, 255]));
+        assert_eq!(app.doc.get(2, 1), Some([10, 200, 20, 255]));
+        assert!(!app.doc.modified);
     }
 
     #[test]
-    fn cancelling_a_floating_move_restores_pixels_and_selection() {
-        let mut app = test_app();
-        let original_selection = IRect::new(1, 1, 3, 3);
-        paint_rect(
-            &mut app,
-            original_selection,
-            Color32::from_rgb(40, 100, 220),
-        );
-        let before = app.doc.px.clone();
-        app.edit.selection = Some(original_selection);
+    fn dragging_pasted_selection_preserves_backdrop_and_undoes_in_one_step() {
+        let mut app = App::new_headless(10, 10);
+        let backdrop = [42, 99, 177, 255];
+        app.doc
+            .fill_all(Color32::from_rgba_unmultiplied(42, 99, 177, 255));
+        app.hist.reset_clean();
 
-        app.start_move_selection();
-        app.nudge_selection(2, 1);
-        assert_ne!(app.edit.selection, Some(original_selection));
+        app.clipboard.set(crate::clipboard::Clip {
+            px: [250, 20, 30, 255].repeat(4),
+            w: 2,
+            h: 2,
+        });
 
-        app.cancel_current();
+        // Paste lands centred at (4, 4).
+        assert!(app.paste().unwrap());
+        assert_eq!(app.doc.get(4, 4), Some([250, 20, 30, 255]));
 
-        assert_eq!(app.doc.px, before);
-        assert_eq!(app.edit.selection, Some(original_selection));
-        assert!(app.edit.floating.is_none());
-        assert!(app.edit.session.is_none());
+        // Click inside the floating paste, drag to (1, 1), and release.
+        app.pointer_press(Btn::Primary, Pos2::new(4.5, 4.5), false, false);
+        app.pointer_move(Pos2::new(1.5, 1.5), false, 0.016);
+        app.pointer_release();
+
+        // Backdrop under initial paste location (4, 4) MUST remain intact.
+        assert_eq!(app.doc.get(4, 4), Some(backdrop));
+        assert_eq!(app.doc.get(5, 5), Some(backdrop));
+        assert_eq!(app.doc.get(1, 1), Some([250, 20, 30, 255]));
+        assert_eq!(app.hist.undo_len(), 1);
+
+        // A single Undo restores the clean backdrop.
+        app.undo();
+        assert_eq!(app.doc.get(1, 1), Some(backdrop));
+        assert_eq!(app.doc.get(4, 4), Some(backdrop));
+        assert!(!app.doc.modified);
     }
 
     #[test]
-    fn document_replacement_clears_gesture_state_but_keeps_clipboard() {
-        let mut app = test_app();
-        let (w, h) = (app.doc.w, app.doc.h);
-        app.edit.session = Some(Session {
-            base: Vec::new(),
-            base_rect: None,
-            mask: Mask::new(w, h),
-            kind: Kind::Stroke,
-            color: Color32::BLACK,
-            erase: false,
-            opacity: 1.0,
-            prev: None,
-            last: (0.0, 0.0),
-            start: (0.0, 0.0),
-            clip: None,
-        });
-        app.edit.floating = Some(Floating {
-            px: vec![1, 2, 3, 4],
-            w: 1,
-            h: 1,
-            pos: (0, 0),
-        });
-        app.edit.text = Some(TextSession {
-            pos: (1.0, 1.0),
-            text: "draft".to_string(),
-            size: 12.0,
-            bold: false,
-            family: crate::fonts::BUILTIN_INTER.to_string(),
-            just_created: false,
-        });
-        app.edit.polygon.push((1.0, 1.0));
+    fn nudge_then_drag_selection_preserves_intermediate_backdrop() {
+        let mut app = App::new_headless(12, 12);
+        let bg = [80, 120, 160, 255];
+        app.doc
+            .fill_all(Color32::from_rgba_unmultiplied(bg[0], bg[1], bg[2], bg[3]));
+        app.doc.set(1, 1, [255, 0, 0, 255]);
+        app.hist.reset_clean();
+
+        app.set_tool(Tool::Select);
         app.edit.selection = Some(IRect::new(1, 1, 2, 2));
-        app.edit.select_drag_start = Some((1, 1));
-        app.edit.move_float_origin = Some((0, 0));
-        app.edit.dragging = Some(Btn::Primary);
-        app.edit.clipboard = Some(Clip {
-            px: vec![9, 8, 7, 6],
+        app.nudge_selection(1, 0);
+        app.nudge_selection(1, 0);
+        app.pointer_press(Btn::Primary, Pos2::new(3.2, 1.2), false, false);
+        app.pointer_move(Pos2::new(8.2, 8.2), false, 0.016);
+        app.pointer_release();
+
+        assert_eq!(app.doc.get(1, 1), Some([0, 0, 0, 0]));
+        assert_eq!(app.doc.get(2, 1), Some(bg));
+        assert_eq!(app.doc.get(3, 1), Some(bg));
+        assert_eq!(app.doc.get(8, 8), Some([255, 0, 0, 255]));
+        assert_eq!(app.hist.undo_len(), 1);
+    }
+
+    #[test]
+    fn copy_and_cut_floating_paste_preserve_alpha_and_backdrop() {
+        let mut app = App::new_headless(8, 8);
+        let bg = [10, 20, 30, 255];
+        app.doc
+            .fill_all(Color32::from_rgba_unmultiplied(bg[0], bg[1], bg[2], bg[3]));
+        app.hist.reset_clean();
+
+        let translucent = [200, 100, 50, 96];
+        app.clipboard.set(crate::clipboard::Clip {
+            px: translucent.to_vec(),
             w: 1,
             h: 1,
         });
+        assert!(app.paste().unwrap());
 
-        app.new_doc(4, 3, true)
-            .expect("replacement dimensions are valid");
+        app.copy_selection();
+        assert!(app.edit.is_floating());
+        let copied = app.clipboard.get().unwrap().unwrap();
+        assert_eq!(copied.px, translucent);
 
-        assert_eq!((app.doc.w, app.doc.h), (4, 3));
-        assert!(app.edit.session.is_none());
-        assert!(app.edit.floating.is_none());
-        assert!(app.edit.text.is_none());
-        assert!(app.edit.polygon.is_empty());
-        assert!(app.edit.selection.is_none());
-        assert!(app.edit.select_drag_start.is_none());
-        assert!(app.edit.move_float_origin.is_none());
-        assert!(app.edit.dragging.is_none());
-        assert!(app.edit.clipboard.is_some());
+        app.cut_selection();
+        assert!(!app.edit.is_floating());
+        assert_eq!(app.doc.get(3, 3), Some(bg));
+        assert!(!app.doc.modified);
     }
 
     #[test]
-    fn live_text_can_move_before_commit() {
-        let mut app = test_app();
-        app.doc = Doc::new(200, 100, Some(Color32::WHITE)).expect("test dimensions are valid");
-        app.tool = Tool::Text;
-        app.pointer_press(Btn::Primary, Pos2::new(10.0, 10.0), false, false);
-        app.edit.text.as_mut().expect("text is live").text = "Move me".to_string();
-        app.edit.text.as_mut().expect("text is live").just_created = false;
-        app.refresh_text();
-        let before = app.doc.px.clone();
+    fn crop_resize_rotate_and_flip_are_undoable() {
+        let mut app = App::new_headless(6, 4);
+        app.doc.set(1, 2, [12, 34, 56, 255]);
+        let original = app.doc.px.clone();
+        app.hist.reset_clean();
 
-        app.move_text_by(Vec2::new(2.0, 1.0));
-        app.move_text_by(Vec2::new(3.0, 4.0));
+        app.image_op(ImageOp::RotateCw);
+        assert_eq!((app.doc.w, app.doc.h), (4, 6));
+        assert!(app.doc.modified);
 
-        assert_eq!(
-            app.edit.text.as_ref().expect("text is still live").pos,
-            (15.0, 15.0)
-        );
-        app.scale = 2.0;
-        app.move_text_by(Vec2::new(4.0, 6.0));
-        assert_eq!(
-            app.edit.text.as_ref().expect("text is still live").pos,
-            (17.0, 18.0)
-        );
-        app.move_text_by(Vec2::new(-10_000.0, 10_000.0));
-        assert_eq!(
-            app.edit.text.as_ref().expect("text is still live").pos,
-            (0.0, 100.0)
-        );
-        assert_ne!(app.doc.px, before);
-        assert!(app.edit.session.is_some());
-        app.commit_current();
-        assert!(app.edit.text.is_none());
-    }
+        app.edit.selection = Some(IRect::new(0, 0, 2, 2));
+        app.crop_to_selection();
+        assert_eq!((app.doc.w, app.doc.h), (2, 2));
 
-    #[test]
-    fn clear_canvas_supports_undo_and_redo() {
-        let mut app = test_app();
-        app.colors.secondary = Color32::BLACK;
+        app.resize_canvas(5, 5, false).unwrap();
+        assert_eq!((app.doc.w, app.doc.h), (5, 5));
 
-        app.clear_canvas();
-        assert_eq!(app.doc.color_at(0, 0), Color32::BLACK);
+        app.image_op(ImageOp::FlipH);
 
         app.undo();
-        assert_eq!(app.doc.color_at(0, 0), Color32::WHITE);
-        app.redo();
-        assert_eq!(app.doc.color_at(0, 0), Color32::BLACK);
+        app.undo();
+        assert_eq!((app.doc.w, app.doc.h), (2, 2));
+        app.undo();
+        assert_eq!((app.doc.w, app.doc.h), (4, 6));
+        app.undo();
+        assert_eq!((app.doc.w, app.doc.h), (6, 4));
+        assert_eq!(app.doc.px, original);
+        assert!(!app.doc.modified);
     }
 
     #[test]
-    fn zoom_at_preserves_the_image_point_under_the_anchor() {
-        let mut app = test_app();
-        let view = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
-        let anchor = Pos2::new(20.0, 30.0);
-        let image_point = app.screen_to_image(anchor);
+    fn shift_select_anchors_at_start_in_every_quadrant() {
+        let mut app = App::new_headless(20, 20);
+        app.set_tool(Tool::Select);
+        app.pointer_press(Btn::Primary, Pos2::new(10.2, 10.2), false, false);
 
-        app.zoom_at(2.0, Some(anchor), view);
+        app.drag_select(Pos2::new(6.2, 8.2), true);
+        let sel = app.edit.selection.unwrap();
+        assert_eq!(sel, IRect::new(6, 6, 11, 11));
+        assert_eq!(sel.w(), sel.h());
+    }
 
-        let canvas_size = Vec2::new(app.doc.w as f32, app.doc.h as f32) * app.view.zoom;
-        let origin = view.center() - canvas_size * 0.5 + app.view.pan;
-        let remapped = origin + image_point.to_vec2() * app.view.zoom;
-        assert!((remapped.x - anchor.x).abs() < 1e-4);
-        assert!((remapped.y - anchor.y).abs() < 1e-4);
+    #[test]
+    fn escape_cancels_pending_after_save() {
+        let ctx = Context::default();
+        let mut app = App::new_headless(8, 8);
+        app.file_dialog = Some(FileDialog::save("test.png", None));
+        app.pending_after_save = Some(Pending::Quit);
+
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out = ctx.run_ui(raw, |ui| {
+            shortcuts::handle(&mut app, ui.ctx(), None);
+        });
+        out.textures_delta.clear();
+        assert!(app.file_dialog.is_none());
+        assert!(app.pending_after_save.is_none());
+    }
+
+    #[test]
+    fn long_stroke_across_large_canvas_roundtrips_cleanly() {
+        let mut app = App::new_headless(400, 300);
+        let initial = app.doc.px.clone();
+        app.set_tool(Tool::Brush);
+        app.opts.size = 10.0;
+        app.colors.primary = Color32::from_rgb(220, 40, 90);
+
+        app.pointer_press(Btn::Primary, Pos2::new(5.0, 5.0), false, false);
+        for step in 1..=20 {
+            let t = step as f32 / 20.0;
+            app.pointer_move(Pos2::new(5.0 + 385.0 * t, 5.0 + 285.0 * t), false, 0.016);
+        }
+        app.pointer_release();
+
+        assert!(app.doc.modified);
+        assert_ne!(app.doc.get(200, 150), Some([255, 255, 255, 255]));
+        app.undo();
+        assert_eq!(app.doc.px, initial);
+        assert!(!app.doc.modified);
+    }
+
+    #[test]
+    fn full_ui_frame_renders_every_tool_and_modal_without_panicking() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = App::new_headless(64, 48);
+        theme::apply(&ctx, &app.theme);
+        app.view.zoom = 12.0; // exercise pixel grid + single-quad checkerboard
+        app.view.fit_pending = false;
+        app.edit.selection = Some(IRect::new(4, 4, 20, 16));
+
+        let run_frame = |app: &mut App| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.top_bar(ui, None);
+                app.status_bar(ui);
+                app.tool_dock(ui);
+                app.right_panel(ui);
+                app.canvas(ui);
+                app.overlays(ui.ctx(), None);
+            });
+            out.textures_delta.clear();
+        };
+
+        for tool in Tool::ALL {
+            app.set_tool(tool);
+            run_frame(&mut app);
+        }
+        for dialog in [
+            Dialog::New,
+            Dialog::Resize,
+            Dialog::About,
+            Dialog::Shortcuts,
+            Dialog::Discard(Pending::New),
+        ] {
+            app.dialog = Some(dialog);
+            run_frame(&mut app);
+        }
+        app.dialog = None;
+        app.file_dialog = Some(FileDialog::save("demo.png", None));
+        run_frame(&mut app);
+        app.file_dialog = None;
+
+        // Also render a light-theme frame to verify checker texture reload.
+        app.prefs.theme_dark = false;
+        app.theme = Theme::light();
+        theme::apply(&ctx, &app.theme);
+        run_frame(&mut app);
+
+        // Ensure leaking/dropping GPU handles in headless mode releases cleanly.
+        app.tex = None;
+        app.checker_tex = None;
+        let mut cleanup = ctx.run_ui(egui::RawInput::default(), |_| {});
+        cleanup.textures_delta.clear();
+    }
+
+    #[test]
+    fn oversize_new_doc_leaves_current_state_untouched() {
+        let mut app = App::new_headless(8, 8);
+        app.doc.set(2, 2, [20, 40, 60, 255]);
+        app.doc.modified = true;
+
+        assert!(app.new_doc(9_000, 10, false).is_err());
+        assert_eq!((app.doc.w, app.doc.h), (8, 8));
+        assert_eq!(app.doc.get(2, 2), Some([20, 40, 60, 255]));
+        assert!(app.doc.modified);
     }
 }

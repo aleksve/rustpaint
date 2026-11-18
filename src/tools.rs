@@ -1,11 +1,11 @@
-//! Tool definitions and per-tool options.
+//! Tool definitions, tool options, and colour palette helpers.
 
 use eframe::egui::{Color32, Key};
 
 use crate::icons::Icon;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Tool {
+pub(crate) enum Tool {
     Select,
     Pencil,
     Brush,
@@ -115,13 +115,13 @@ impl Tool {
             Tool::Select => {
                 "Drag to select · drag inside to move · Ctrl+C / Ctrl+V to copy & paste"
             }
-            Tool::Pencil => "Hard edged freehand drawing",
-            Tool::Brush => "Soft round brush with adjustable hardness",
+            Tool::Pencil => "Hard-edged pixel drawing",
+            Tool::Brush => "Round brush with adjustable hardness and anti-aliasing",
             Tool::Eraser => "Erase to transparency",
             Tool::Airbrush => "Spray paint, hold still to build up",
             Tool::Fill => "Fill a contiguous area of similar colour",
             Tool::Picker => "Pick a colour from the canvas",
-            Tool::Text => "Click to place text, then type",
+            Tool::Text => "Click to place text, type, then click Apply or press Ctrl+Enter",
             Tool::Line => "Drag for a straight line (Shift = 45° steps)",
             Tool::Rect => "Drag a rectangle (Shift = square)",
             Tool::Ellipse => "Drag an ellipse (Shift = circle)",
@@ -148,8 +148,31 @@ impl Tool {
         )
     }
 
+    pub fn max_size(self) -> f32 {
+        if self == Tool::Pencil { 64.0 } else { 300.0 }
+    }
+
+    pub fn default_size(self) -> f32 {
+        match self {
+            Tool::Pencil => 2.0,
+            Tool::Brush => 12.0,
+            Tool::Eraser => 24.0,
+            Tool::Airbrush => 28.0,
+            Tool::Line | Tool::Rect | Tool::Ellipse | Tool::Polygon => 4.0,
+            _ => 12.0,
+        }
+    }
+
     pub fn uses_softness(self) -> bool {
-        matches!(self, Tool::Brush | Tool::Airbrush)
+        matches!(self, Tool::Brush | Tool::Eraser | Tool::Airbrush)
+    }
+
+    pub fn uses_antialias(self) -> bool {
+        matches!(self, Tool::Brush | Tool::Line)
+    }
+
+    pub fn uses_opacity(self) -> bool {
+        !matches!(self, Tool::Select | Tool::Fill | Tool::Picker | Tool::Pan)
     }
 
     pub fn uses_fill_toggle(self) -> bool {
@@ -158,10 +181,10 @@ impl Tool {
 }
 
 #[derive(Clone, Debug)]
-pub struct ToolOptions {
+pub(crate) struct ToolOptions {
     pub size: f32,
     pub opacity: f32,
-    /// 0 = very soft edge, 1 = hard edge (brush / airbrush only).
+    /// 0 = very soft edge, 1 = hard edge (brush / eraser / airbrush).
     pub hardness: f32,
     pub antialias: bool,
     /// Shape tools: fill instead of outline.
@@ -190,7 +213,10 @@ impl Default for ToolOptions {
     }
 }
 
-pub struct Colors {
+pub(crate) const DEFAULT_PRIMARY: Color32 = Color32::from_rgb(0x1a, 0x1c, 0x22);
+pub(crate) const DEFAULT_SECONDARY: Color32 = Color32::WHITE;
+
+pub(crate) struct Colors {
     pub primary: Color32,
     pub secondary: Color32,
     pub recent: Vec<Color32>,
@@ -199,9 +225,9 @@ pub struct Colors {
 impl Default for Colors {
     fn default() -> Self {
         Self {
-            primary: Color32::from_rgb(0x1a, 0x1c, 0x22),
-            secondary: Color32::WHITE,
-            recent: palette().iter().take(8 * 2).cloned().collect(),
+            primary: DEFAULT_PRIMARY,
+            secondary: DEFAULT_SECONDARY,
+            recent: PALETTE[..16].to_vec(),
         }
     }
 }
@@ -211,41 +237,86 @@ impl Colors {
         std::mem::swap(&mut self.primary, &mut self.secondary);
     }
 
+    pub fn reset(&mut self) {
+        self.primary = DEFAULT_PRIMARY;
+        self.secondary = DEFAULT_SECONDARY;
+    }
+
     pub fn push_recent(&mut self, c: Color32) {
+        if self.recent.first() == Some(&c) {
+            return;
+        }
         self.recent.retain(|e| *e != c);
         self.recent.insert(0, c);
         self.recent.truncate(16);
     }
 }
 
-/// The classic MS Paint palette plus a few modern extras, 2 rows of 14.
-pub fn palette() -> Vec<Color32> {
-    let hex = [
-        0x000000, 0x7f7f7f, 0x880015, 0xed1c24, 0xff7f27, 0xfff200, 0x22b14c, 0x00a2e8, 0x3f48cc,
-        0xa349a4, 0xffffff, 0xc3c3c3, 0xb97a57, 0xffaec9, 0xffc90e, 0xefe4b0, 0xb5e61d, 0x99d9ea,
-        0x7092be, 0xc8bfe7, 0xf5f5f7, 0x9aa3b2, 0x6b4f3a, 0xe0727f, 0xf2b33d, 0xcfd8a0, 0x7fb069,
-        0x4aa3c7, 0x5b6ee1, 0x9b6bd6,
-    ];
-    hex.iter()
-        .map(|v| {
-            Color32::from_rgb(
-                ((v >> 16) & 0xff) as u8,
-                ((v >> 8) & 0xff) as u8,
-                (v & 0xff) as u8,
-            )
-        })
-        .collect()
+const fn hex_rgb(v: u32) -> Color32 {
+    Color32::from_rgb(
+        ((v >> 16) & 0xff) as u8,
+        ((v >> 8) & 0xff) as u8,
+        (v & 0xff) as u8,
+    )
 }
 
-pub fn to_hex(c: Color32) -> String {
-    let [r, g, b, _] = c.to_srgba_unmultiplied();
-    format!("#{:02X}{:02X}{:02X}", r, g, b)
+/// The classic MS Paint palette plus modern muted tones (3 rows of 10).
+pub(crate) const PALETTE: [Color32; 30] = [
+    hex_rgb(0x000000),
+    hex_rgb(0x7f7f7f),
+    hex_rgb(0x880015),
+    hex_rgb(0xed1c24),
+    hex_rgb(0xff7f27),
+    hex_rgb(0xfff200),
+    hex_rgb(0x22b14c),
+    hex_rgb(0x00a2e8),
+    hex_rgb(0x3f48cc),
+    hex_rgb(0xa349a4),
+    hex_rgb(0xffffff),
+    hex_rgb(0xc3c3c3),
+    hex_rgb(0xb97a57),
+    hex_rgb(0xffaec9),
+    hex_rgb(0xffc90e),
+    hex_rgb(0xefe4b0),
+    hex_rgb(0xb5e61d),
+    hex_rgb(0x99d9ea),
+    hex_rgb(0x7092be),
+    hex_rgb(0xc8bfe7),
+    hex_rgb(0xf5f5f7),
+    hex_rgb(0x9aa3b2),
+    hex_rgb(0x6b4f3a),
+    hex_rgb(0xe0727f),
+    hex_rgb(0xf2b33d),
+    hex_rgb(0xcfd8a0),
+    hex_rgb(0x7fb069),
+    hex_rgb(0x4aa3c7),
+    hex_rgb(0x5b6ee1),
+    hex_rgb(0x9b6bd6),
+];
+
+pub(crate) fn to_hex(c: Color32) -> String {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 255 {
+        format!("#{r:02X}{g:02X}{b:02X}")
+    } else {
+        format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+    }
 }
 
-pub fn parse_hex(s: &str) -> Option<Color32> {
-    let s = s.trim().trim_start_matches('#');
+pub(crate) fn parse_hex(s: &str) -> Option<Color32> {
+    let s = s.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if !matches!(s.len(), 3 | 6 | 8) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let v = u32::from_str_radix(s, 16).ok()?;
     match s.len() {
+        3 => {
+            let r = ((v >> 8) & 0xf) as u8;
+            let g = ((v >> 4) & 0xf) as u8;
+            let b = (v & 0xf) as u8;
+            Some(Color32::from_rgb(r * 17, g * 17, b * 17))
+        }
         6 => Some(Color32::from_rgb(
             ((v >> 16) & 0xff) as u8,
             ((v >> 8) & 0xff) as u8,
@@ -258,5 +329,25 @@ pub fn parse_hex(s: &str) -> Option<Color32> {
             (v & 0xff) as u8,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_handles_valid_forms_and_rejects_sign_prefix() {
+        assert_eq!(parse_hex("#F0A"), Some(Color32::from_rgb(0xff, 0x00, 0xaa)));
+        assert_eq!(
+            parse_hex("#123456"),
+            Some(Color32::from_rgb(0x12, 0x34, 0x56))
+        );
+        assert_eq!(
+            parse_hex("#12345680"),
+            Some(Color32::from_rgba_unmultiplied(0x12, 0x34, 0x56, 0x80))
+        );
+        assert_eq!(parse_hex("+12345"), None);
+        assert_eq!(parse_hex("#12345"), None);
     }
 }

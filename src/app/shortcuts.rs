@@ -1,39 +1,63 @@
 //! Keyboard, clipboard, and command-key dispatch for the application shell.
 
-use eframe::egui::{self, Color32, Context, Key};
+use eframe::egui::{self, Context, Key};
 
 use super::{App, Dialog};
 use crate::tools::Tool;
 
-pub(super) fn handle(app: &mut App, ctx: &Context) {
-    // Read the modifiers that came *with* each key event: this keeps
-    // shortcuts working even when the modifier state itself is stale
-    // (remote desktops, synthetic input, IMEs, ...).
-    let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {
+#[derive(Clone, Copy)]
+struct KeyPress {
+    key: Key,
+    modifiers: egui::Modifiers,
+    repeat: bool,
+}
+
+pub(super) fn handle(app: &mut App, ctx: &Context, frame: Option<&eframe::Frame>) {
+    if app.io_job.is_some() {
+        return;
+    }
+
+    // Read the modifiers carried by each key event so shortcuts stay reliable
+    // across remote desktops, IMEs, and synthetic input.
+    let pressed: Vec<KeyPress> = ctx.input(|i| {
         i.events
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|e| match *e {
                 egui::Event::Key {
                     key,
                     pressed: true,
+                    repeat,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } => Some(KeyPress {
+                    key,
+                    modifiers,
+                    repeat,
+                }),
                 _ => None,
             })
             .collect()
     });
-    let with_cmd = |k: Key| -> Option<egui::Modifiers> {
+
+    let cmd_key = |k: Key, allow_repeat: bool| -> Option<egui::Modifiers> {
         pressed
             .iter()
-            .find(|(pk, m)| *pk == k && m.command)
-            .map(|(_, m)| *m)
+            .find(|ev| ev.key == k && ev.modifiers.command && (allow_repeat || !ev.repeat))
+            .map(|ev| ev.modifiers)
     };
-    let plain = |k: Key| -> Option<egui::Modifiers> {
+    // Plain tool/editor keys must not fire when Ctrl, Cmd, or Alt is held
+    // (avoiding collisions with Alt menu mnemonics or macOS Ctrl shortcuts).
+    let plain_key = |k: Key, allow_repeat: bool| -> Option<egui::Modifiers> {
         pressed
             .iter()
-            .find(|(pk, m)| *pk == k && !m.command)
-            .map(|(_, m)| *m)
+            .find(|ev| {
+                ev.key == k
+                    && !ev.modifiers.command
+                    && !ev.modifiers.ctrl
+                    && !ev.modifiers.alt
+                    && (allow_repeat || !ev.repeat)
+            })
+            .map(|ev| ev.modifiers)
     };
 
     let (ev_copy, ev_cut, ev_paste) = ctx.input(|i| {
@@ -49,25 +73,32 @@ pub(super) fn handle(app: &mut App, ctx: &Context) {
         (c, x, p)
     });
 
-    let typing = ctx.wants_keyboard_input();
-
-    if pressed.iter().any(|(k, _)| *k == Key::Escape) {
-        if app.edit.text.is_some() || !app.edit.polygon.is_empty() || app.edit.session.is_some() {
+    if pressed.iter().any(|ev| ev.key == Key::Escape && !ev.repeat) {
+        if app.modal_open() {
+            // Always clear `pending_after_save` alongside any cancelled dialog.
+            app.cancel_dialogs();
+            return;
+        } else if app.edit.session.is_some() {
             app.cancel_current();
+            return;
         } else if app.edit.selection.is_some() {
             app.deselect();
-        } else if app.dialog.is_some() {
-            app.dialog = None;
-        } else if app.file_dialog.is_some() {
-            app.file_dialog = None;
+            return;
         }
     }
 
-    if app.edit.text.is_some() && with_cmd(Key::Enter).is_some() {
+    if app.edit.is_editing_text() && cmd_key(Key::Enter, false).is_some() {
         app.commit_current();
+        return;
     }
 
+    let typing = ctx.egui_wants_keyboard_input();
     if typing || app.modal_open() {
+        return;
+    }
+
+    if plain_key(Key::F1, false).is_some() {
+        app.dialog = Some(Dialog::Shortcuts);
         return;
     }
 
@@ -80,99 +111,107 @@ pub(super) fn handle(app: &mut App, ctx: &Context) {
         return;
     }
     if ev_paste {
-        app.paste();
+        app.paste_with_toast(ctx);
         return;
     }
 
     // ---- with Ctrl / Cmd
-    if with_cmd(Key::N).is_some() {
+    if cmd_key(Key::N, false).is_some() {
         app.ask_new();
-    } else if with_cmd(Key::O).is_some() {
-        app.ask_open(ctx);
-    } else if let Some(m) = with_cmd(Key::S) {
+    } else if cmd_key(Key::O, false).is_some() {
+        app.ask_open(ctx, frame);
+    } else if let Some(m) = cmd_key(Key::S, false) {
         if m.shift {
-            app.save_dialog(ctx);
+            app.save_dialog(ctx, frame);
         } else {
-            app.quick_save(ctx);
+            app.quick_save(ctx, frame);
         }
-    } else if let Some(m) = with_cmd(Key::Z) {
+    } else if let Some(m) = cmd_key(Key::Z, true) {
         if m.shift {
             app.redo();
         } else {
             app.undo();
         }
-    } else if with_cmd(Key::Y).is_some() {
+    } else if cmd_key(Key::Y, true).is_some() {
         app.redo();
-    } else if with_cmd(Key::A).is_some() {
+    } else if cmd_key(Key::A, false).is_some() {
         app.select_all();
-    } else if with_cmd(Key::C).is_some() {
+    } else if cmd_key(Key::C, false).is_some() {
         app.copy_selection();
-    } else if with_cmd(Key::X).is_some() {
+    } else if cmd_key(Key::X, false).is_some() {
         app.cut_selection();
-    } else if with_cmd(Key::V).is_some() {
-        app.paste();
-    } else if with_cmd(Key::D).is_some() {
+    } else if cmd_key(Key::V, false).is_some() {
+        app.paste_with_toast(ctx);
+    } else if cmd_key(Key::D, false).is_some() {
         app.deselect();
-    } else if with_cmd(Key::Num0).is_some() {
+    } else if cmd_key(Key::Num0, false).is_some() {
         let r = app.last_view_rect;
         app.set_zoom(1.0, r);
-    } else if with_cmd(Key::Num9).is_some() {
+    } else if cmd_key(Key::Num9, false).is_some() {
         let r = app.last_view_rect;
         app.fit_view(r);
-    } else if with_cmd(Key::Plus).is_some() || with_cmd(Key::Equals).is_some() {
+    } else if cmd_key(Key::Plus, true).is_some() || cmd_key(Key::Equals, true).is_some() {
         let r = app.last_view_rect;
         app.zoom_step(1.0, r);
-    } else if with_cmd(Key::Minus).is_some() {
+    } else if cmd_key(Key::Minus, true).is_some() {
         let r = app.last_view_rect;
         app.zoom_step(-1.0, r);
-    } else if with_cmd(Key::E).is_some() {
-        app.resize_w = app.doc.w as u32;
-        app.resize_h = app.doc.h as u32;
-        app.dialog = Some(Dialog::Resize);
+    } else if cmd_key(Key::Quote, false).is_some() {
+        app.view.grid = !app.view.grid;
+    } else if cmd_key(Key::E, false).is_some() {
+        app.open_resize_dialog();
     }
-    if pressed.iter().any(|(_, m)| m.command) {
+    if pressed.iter().any(|ev| ev.modifiers.command) {
         return;
     }
 
     // ---- plain keys
     for t in Tool::ALL {
-        if plain(t.shortcut_key()).is_some() {
+        if plain_key(t.shortcut_key(), false).is_some() {
             app.set_tool(t);
         }
     }
 
-    if plain(Key::Delete).is_some() || plain(Key::Backspace).is_some() {
+    if plain_key(Key::Delete, false).is_some() || plain_key(Key::Backspace, false).is_some() {
         app.delete_selection();
     }
-    if plain(Key::OpenBracket).is_some() {
-        app.opts.size = (app.opts.size - if app.opts.size > 10.0 { 5.0 } else { 1.0 }).max(1.0);
+    if app.tool.uses_size() {
+        let max = app.tool.max_size();
+        if plain_key(Key::OpenBracket, true).is_some() {
+            let step = if app.opts.size > 10.0 { 5.0 } else { 1.0 };
+            app.opts.size = (app.opts.size - step).clamp(1.0, max);
+            app.tool_sizes.insert(app.tool, app.opts.size);
+        }
+        if plain_key(Key::CloseBracket, true).is_some() {
+            let step = if app.opts.size >= 10.0 { 5.0 } else { 1.0 };
+            app.opts.size = (app.opts.size + step).clamp(1.0, max);
+            app.tool_sizes.insert(app.tool, app.opts.size);
+        }
     }
-    if plain(Key::CloseBracket).is_some() {
-        app.opts.size = (app.opts.size + if app.opts.size >= 10.0 { 5.0 } else { 1.0 }).min(300.0);
-    }
-    if plain(Key::X).is_some() {
+    if plain_key(Key::X, false).is_some() {
         app.colors.swap();
+        app.sync_live_text_color_and_opacity();
     }
-    if plain(Key::D).is_some() {
-        app.colors.primary = Color32::from_rgb(0x1a, 0x1c, 0x22);
-        app.colors.secondary = Color32::WHITE;
+    if plain_key(Key::D, false).is_some() {
+        app.colors.reset();
+        app.sync_live_text_color_and_opacity();
     }
-    if plain(Key::Enter).is_some() {
-        if !app.edit.polygon.is_empty() {
+    if plain_key(Key::Enter, false).is_some() {
+        if app.edit.is_drawing_polygon() {
             app.finish_polygon();
-        } else if app.edit.floating.is_some() {
+        } else if app.edit.is_floating() {
             app.commit_current();
         }
     }
-    for (k, m) in [
+    for (k, dir) in [
         (Key::ArrowLeft, (-1, 0)),
         (Key::ArrowRight, (1, 0)),
         (Key::ArrowUp, (0, -1)),
         (Key::ArrowDown, (0, 1)),
     ] {
-        if let Some(md) = plain(k) {
+        if let Some(md) = plain_key(k, true) {
             let step = if md.shift { 10 } else { 1 };
-            app.nudge_selection(m.0 * step, m.1 * step);
+            app.nudge_selection(dir.0 * step, dir.1 * step);
         }
     }
 }

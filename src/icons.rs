@@ -4,8 +4,8 @@
 use eframe::egui::{Color32, IconData, Painter, Pos2, Rect, Shape, Stroke};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // a small icon library: not every glyph is used yet
-pub enum Icon {
+#[allow(dead_code)] // small icon library: keep spare glyphs available for menus/dialogs
+pub(crate) enum Icon {
     Pencil,
     Brush,
     Eraser,
@@ -55,15 +55,15 @@ pub enum Icon {
 }
 
 /// Generate the application icon without shipping a platform-specific image.
-pub fn app_icon() -> IconData {
+pub(crate) fn app_icon() -> IconData {
     let n = 128usize;
     let mut rgba = vec![0u8; n * n * 4];
     let (from, to) = ([47u8, 123, 245], [122u8, 168, 255]);
+    let side = n as f32;
     for y in 0..n {
+        let fy = y as f32 + 0.5;
         for x in 0..n {
             let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            let side = n as f32;
             let cov = round_rect_coverage(fx, fy, 4.0, 4.0, side - 4.0, side - 4.0, 26.0);
             if cov <= 0.001 {
                 continue;
@@ -75,10 +75,10 @@ pub fn app_icon() -> IconData {
                 lerp_u8(from[2], to[2], t),
             ];
             let d = crate::geom::distance_to_segment(fx, fy, 34.0, 94.0, 92.0, 34.0);
-            let stroke = (1.0 - (d - 9.0).max(0.0) / 1.5).clamp(0.0, 1.0);
-            if stroke > 0.0 {
+            let stroke_cov = (1.0 - (d - 9.0).max(0.0) / 1.5).clamp(0.0, 1.0);
+            if stroke_cov > 0.0 {
                 for channel in &mut c {
-                    *channel = lerp_u8(*channel, 255, stroke);
+                    *channel = lerp_u8(*channel, 255, stroke_cov);
                 }
             }
             let dn = ((fx - 92.0).powi(2) + (fy - 34.0).powi(2)).sqrt();
@@ -89,7 +89,7 @@ pub fn app_icon() -> IconData {
                 }
             }
             let i = (y * n + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], (cov * 255.0) as u8]);
+            rgba[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], (cov * 255.0).round() as u8]);
         }
     }
     IconData {
@@ -124,7 +124,7 @@ struct Ic<'a> {
     c: Color32,
 }
 
-impl<'a> Ic<'a> {
+impl Ic<'_> {
     fn pt(&self, x: f32, y: f32) -> Pos2 {
         Pos2::new(self.o.x + x * self.s, self.o.y + y * self.s)
     }
@@ -164,7 +164,7 @@ impl<'a> Ic<'a> {
             (x0 + r, y1 - r, 90.0, 180.0),
             (x0 + r, y0 + r, 180.0, 270.0),
         ];
-        let mut pts: Vec<Pos2> = Vec::new();
+        let mut pts: Vec<Pos2> = Vec::with_capacity(20);
         for (cx, cy, a0, a1) in arcs {
             for i in 0..=4 {
                 let t = i as f32 / 4.0;
@@ -175,7 +175,7 @@ impl<'a> Ic<'a> {
         self.p.add(Shape::closed_line(pts, stroke(self.w, self.c)));
     }
     fn ellipse(&self, c: (f32, f32), rx: f32, ry: f32) {
-        let mut pts = Vec::new();
+        let mut pts = Vec::with_capacity(33);
         for i in 0..=32 {
             let a = (i as f32 / 32.0) * std::f32::consts::TAU;
             pts.push(self.pt(c.0 + rx * a.cos(), c.1 + ry * a.sin()));
@@ -183,8 +183,8 @@ impl<'a> Ic<'a> {
         self.p.add(Shape::closed_line(pts, stroke(self.w, self.c)));
     }
     fn arc(&self, c: (f32, f32), r: f32, a0: f32, a1: f32) {
-        let mut pts = Vec::new();
         let n = 20;
+        let mut pts = Vec::with_capacity(n + 1);
         for i in 0..=n {
             let t = i as f32 / n as f32;
             let a = (a0 + (a1 - a0) * t).to_radians();
@@ -217,7 +217,7 @@ impl<'a> Ic<'a> {
     }
 }
 
-pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
+pub(crate) fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
     let side = rect.width().min(rect.height());
     let s = side * 0.82;
     let o = Pos2::new(rect.center().x - s * 0.5, rect.center().y - s * 0.5);
@@ -299,16 +299,15 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
             ic.line((0.30, 0.56), (0.16, 0.48));
         }
         Undo => {
-            // arrow curving back to the left, with the tail dropping down
             ic.arc((0.50, 0.44), 0.30, 200.0, 350.0);
             ic.line((0.50, 0.74), (0.78, 0.74));
-            ic.head((0.20, 0.44), 200.0 * std::f32::consts::PI / 180.0, 0.22);
+            ic.head((0.20, 0.44), 200.0f32.to_radians(), 0.22);
             ic.line((0.50 - 0.30 * 0.94, 0.44 - 0.30 * 0.34), (0.20, 0.44));
         }
         Redo => {
             ic.arc((0.50, 0.44), 0.30, 340.0, 190.0);
             ic.line((0.22, 0.74), (0.50, 0.74));
-            ic.head((0.80, 0.44), 340.0 * std::f32::consts::PI / 180.0, 0.22);
+            ic.head((0.80, 0.44), 340.0f32.to_radians(), 0.22);
             ic.line((0.80, 0.44), (0.50 + 0.30 * 0.94, 0.44 - 0.30 * 0.34));
         }
         New => {
@@ -385,7 +384,7 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
             ic.line((0.20, 0.36), (0.80, 0.36));
             ic.head((0.80, 0.36), 0.0, 0.18);
             ic.line((0.80, 0.68), (0.20, 0.68));
-            ic.head((0.20, 0.68), 180.0, 0.18);
+            ic.head((0.20, 0.68), std::f32::consts::PI, 0.18);
         }
         Trash => {
             ic.line((0.16, 0.28), (0.84, 0.28));
@@ -433,7 +432,8 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
         }
         Invert => {
             ic.circle((0.5, 0.5), 0.34);
-            let mut pts = vec![(0.5f32, 0.5f32)];
+            let mut pts = Vec::with_capacity(26);
+            pts.push((0.5f32, 0.5f32));
             for i in 0..=24 {
                 let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 24.0;
                 pts.push((0.5 + 0.34 * a.cos(), 0.5 + 0.34 * a.sin()));
@@ -504,40 +504,105 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, width: f32) {
     }
 }
 
-/// Marching-ants rectangle used for selections.
-pub fn marching_ants(p: &Painter, rect: Rect, offset: f32, dark: bool) {
+/// Marching-ants rectangle used for selections, clipped to the painter's
+/// viewport so high zoom factors only emit visible dashes.
+pub(crate) fn marching_ants(p: &Painter, rect: Rect, offset: f32, dark: bool) {
     let c1 = if dark {
         Color32::from_rgb(0x18, 0x18, 0x18)
     } else {
-        Color32::from_rgb(0x00, 0x00, 0x00)
+        Color32::BLACK
     };
     let c2 = Color32::WHITE;
-    let dash = 4.0;
-    let corners = [
-        rect.left_top(),
-        rect.right_top(),
-        rect.right_bottom(),
-        rect.left_bottom(),
-    ];
-    for i in 0..4 {
-        let (p0, p1) = (corners[i], corners[(i + 1) % 4]);
-        let v = p1 - p0;
-        let len = v.length();
+    let dash = 4.0f32;
+    let period = dash * 2.0;
+    let phase = offset.rem_euclid(period);
+    let clip = p.clip_rect().expand(2.0);
+    if !clip.intersects(rect.expand(2.0)) {
+        return;
+    }
+
+    // Horizontal edges: top (left->right) and bottom (right->left).
+    for (y, x_start, x_end, dir_x) in [
+        (rect.top(), rect.left(), rect.right(), 1.0f32),
+        (rect.bottom(), rect.right(), rect.left(), -1.0f32),
+    ] {
+        if y < clip.top() || y > clip.bottom() {
+            continue;
+        }
+        let len = (x_end - x_start).abs();
         if len <= 0.01 {
             continue;
         }
-        let dir = v / len;
-        let mut t = -(offset % (dash * 2.0));
-        let mut k = 0;
-        while t < len {
-            let s = t.max(0.0);
-            let e = (t + dash).min(len);
-            if e > s {
-                let c = if k % 2 == 0 { c1 } else { c2 };
-                p.line_segment([p0 + dir * s, p0 + dir * e], Stroke::new(1.0_f32, c));
-            }
-            t += dash;
-            k += 1;
+        let (vis0, vis1) = if dir_x > 0.0 {
+            (
+                (clip.left() - x_start).clamp(0.0, len),
+                (clip.right() - x_start).clamp(0.0, len),
+            )
+        } else {
+            (
+                (x_start - clip.right()).clamp(0.0, len),
+                (x_start - clip.left()).clamp(0.0, len),
+            )
+        };
+        draw_dashed_span(p, vis0, vis1, dash, phase, c1, c2, |t| {
+            Pos2::new(x_start + dir_x * t, y)
+        });
+    }
+
+    // Vertical edges: right (top->bottom) and left (bottom->top).
+    for (x, y_start, y_end, dir_y) in [
+        (rect.right(), rect.top(), rect.bottom(), 1.0f32),
+        (rect.left(), rect.bottom(), rect.top(), -1.0f32),
+    ] {
+        if x < clip.left() || x > clip.right() {
+            continue;
         }
+        let len = (y_end - y_start).abs();
+        if len <= 0.01 {
+            continue;
+        }
+        let (vis0, vis1) = if dir_y > 0.0 {
+            (
+                (clip.top() - y_start).clamp(0.0, len),
+                (clip.bottom() - y_start).clamp(0.0, len),
+            )
+        } else {
+            (
+                (y_start - clip.bottom()).clamp(0.0, len),
+                (y_start - clip.top()).clamp(0.0, len),
+            )
+        };
+        draw_dashed_span(p, vis0, vis1, dash, phase, c1, c2, |t| {
+            Pos2::new(x, y_start + dir_y * t)
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_dashed_span(
+    p: &Painter,
+    vis0: f32,
+    vis1: f32,
+    dash: f32,
+    phase: f32,
+    c1: Color32,
+    c2: Color32,
+    point_at: impl Fn(f32) -> Pos2,
+) {
+    if vis1 <= vis0 {
+        return;
+    }
+    let first_k = ((vis0 + phase) / dash).floor().max(0.0) as i64;
+    let mut k = first_k;
+    let mut t = k as f32 * dash - phase;
+    while t < vis1 {
+        let s = t.max(vis0);
+        let e = (t + dash).min(vis1);
+        if e > s {
+            let c = if k % 2 == 0 { c1 } else { c2 };
+            p.line_segment([point_at(s), point_at(e)], Stroke::new(1.0_f32, c));
+        }
+        t += dash;
+        k += 1;
     }
 }

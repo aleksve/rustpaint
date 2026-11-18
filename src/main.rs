@@ -1,12 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! RustPaint — a modern, cross-platform take on MS Paint.
 //!
-//! Everything is drawn with egui: no image assets, no platform specific UI
-//! code. The same binary builds and behaves the same on Windows, macOS and
-//! Linux.
+//! Everything is drawn with egui: no external image assets, bundled fonts, and
+//! native OS file dialogs + image clipboard with clean fallbacks on Windows,
+//! macOS and Linux.
 
 mod app;
 mod assets;
+mod clipboard;
 mod doc;
 mod filedlg;
 mod fonts;
@@ -33,10 +34,6 @@ fn main() -> eframe::Result<()> {
             .with_title("RustPaint")
             .with_app_id("rustpaint")
             .with_icon(icons::app_icon()),
-        vsync: true,
-        multisampling: 0,
-        depth_buffer: 0,
-        stencil_buffer: 0,
         ..Default::default()
     };
 
