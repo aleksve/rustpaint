@@ -269,6 +269,7 @@ impl App {
             }
         }
         self.edit.text = None;
+        self.edit.text_editor_rect = None;
         self.edit.polygon.clear();
     }
 
@@ -295,6 +296,7 @@ impl App {
             }
         }
         self.edit.text = None;
+        self.edit.text_editor_rect = None;
         self.edit.polygon.clear();
     }
 
@@ -683,6 +685,30 @@ impl App {
         s.mask.clear();
         te.draw(&mut s.mask, &text, x, y, size);
         self.refresh_masked();
+    }
+
+    /// Return the painted bounds of the live text, with a small grab margin.
+    pub(crate) fn text_hit_rect(&self) -> Option<IRect> {
+        let session = self
+            .edit
+            .session
+            .as_ref()
+            .filter(|s| matches!(s.kind, Kind::Text))?;
+        let b = session.mask.bbox()?;
+        Some(IRect::new(b.x0 - 6, b.y0 - 6, b.x1 + 6, b.y1 + 6))
+    }
+
+    /// Move the live text by one frame's screen-space drag delta, keeping its
+    /// anchor on the canvas so it can always be grabbed again.
+    pub(crate) fn move_text_by(&mut self, delta: Vec2) {
+        let scale = self.scale.max(0.0001);
+        let (max_x, max_y) = (self.doc.w as f32, self.doc.h as f32);
+        let Some(text) = self.edit.text.as_mut() else {
+            return;
+        };
+        text.pos.0 = (text.pos.0 + delta.x / scale).clamp(0.0, max_x);
+        text.pos.1 = (text.pos.1 + delta.y / scale).clamp(0.0, max_y);
+        self.refresh_text();
     }
 
     // -------------------------------------------------------------- selection

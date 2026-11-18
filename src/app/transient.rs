@@ -1,5 +1,7 @@
 //! State that belongs to an in-progress editing gesture.
 
+use eframe::egui::Rect;
+
 use crate::app::Btn;
 use crate::ir::IRect;
 use crate::paint::{Clip, Floating, Session, TextSession};
@@ -19,6 +21,7 @@ pub(crate) struct EditState {
     pub(crate) selection: Option<IRect>,
     pub(crate) select_drag_start: Option<(i32, i32)>,
     pub(crate) move_float_origin: Option<(i32, i32)>,
+    pub(crate) text_editor_rect: Option<Rect>,
     pub(crate) dragging: Option<Btn>,
 }
 
@@ -31,6 +34,7 @@ impl EditState {
         self.polygon.clear();
         self.select_drag_start = None;
         self.move_float_origin = None;
+        self.text_editor_rect = None;
         self.dragging = None;
     }
 

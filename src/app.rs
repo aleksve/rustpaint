@@ -492,6 +492,41 @@ mod tests {
     }
 
     #[test]
+    fn live_text_can_move_before_commit() {
+        let mut app = test_app();
+        app.doc = Doc::new(200, 100, Some(Color32::WHITE)).expect("test dimensions are valid");
+        app.tool = Tool::Text;
+        app.pointer_press(Btn::Primary, Pos2::new(10.0, 10.0), false, false);
+        app.edit.text.as_mut().expect("text is live").text = "Move me".to_string();
+        app.edit.text.as_mut().expect("text is live").just_created = false;
+        app.refresh_text();
+        let before = app.doc.px.clone();
+
+        app.move_text_by(Vec2::new(2.0, 1.0));
+        app.move_text_by(Vec2::new(3.0, 4.0));
+
+        assert_eq!(
+            app.edit.text.as_ref().expect("text is still live").pos,
+            (15.0, 15.0)
+        );
+        app.scale = 2.0;
+        app.move_text_by(Vec2::new(4.0, 6.0));
+        assert_eq!(
+            app.edit.text.as_ref().expect("text is still live").pos,
+            (17.0, 18.0)
+        );
+        app.move_text_by(Vec2::new(-10_000.0, 10_000.0));
+        assert_eq!(
+            app.edit.text.as_ref().expect("text is still live").pos,
+            (0.0, 100.0)
+        );
+        assert_ne!(app.doc.px, before);
+        assert!(app.edit.session.is_some());
+        app.commit_current();
+        assert!(app.edit.text.is_none());
+    }
+
+    #[test]
     fn clear_canvas_supports_undo_and_redo() {
         let mut app = test_app();
         app.colors.secondary = Color32::BLACK;

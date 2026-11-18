@@ -186,6 +186,17 @@ impl App {
         });
         let hovered = response.hovered();
         let canvas_hovered = hover.is_some_and(|point| canvas.contains(point));
+        let text_editor_hovered = hover.is_some_and(|point| {
+            let editor_hovered = self
+                .edit
+                .text_editor_rect
+                .is_some_and(|editor| editor.contains(point));
+            let text_hovered = self.text_hit_rect().is_some_and(|text| {
+                let image = self.screen_to_image(point);
+                text.contains(image.x.floor() as i32, image.y.floor() as i32)
+            });
+            editor_hovered || text_hovered
+        });
 
         if hovered && scroll != Vec2::ZERO {
             if modifiers.ctrl || modifiers.command {
@@ -229,7 +240,7 @@ impl App {
             });
         }
 
-        if canvas_hovered && self.edit.dragging.is_none() {
+        if canvas_hovered && self.edit.dragging.is_none() && !text_editor_hovered {
             if primary_pressed {
                 if let Some(hover) = hover {
                     self.edit.dragging = Some(Btn::Primary);
