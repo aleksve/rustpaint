@@ -56,7 +56,6 @@ impl App {
         let screen = self.image_to_screen(egui::Pos2::new(text_session.pos.0, text_session.pos.1));
         let mut text = text_session.text;
         let mut changed = false;
-        let mut cancel = false;
         let want_focus = text_session.just_created;
         let mut editor_rect = None;
         let mut dragged = false;
@@ -91,9 +90,6 @@ impl App {
                 changed = response.changed();
                 dragged = response.dragged();
                 drag_delta = response.drag_delta();
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    cancel = true;
-                }
             });
 
         self.edit.text_editor_rect = editor_rect;
@@ -110,9 +106,6 @@ impl App {
         }
         if changed {
             self.refresh_text();
-        }
-        if cancel {
-            self.cancel_current();
         }
     }
 

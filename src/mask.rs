@@ -45,8 +45,46 @@ impl Mask {
 
     #[inline]
     fn index(&self, x: i32, y: i32) -> Option<usize> {
-        (x >= 0 && y >= 0 && x < self.w as i32 && y < self.h as i32)
-            .then_some(y as usize * self.w + x as usize)
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        y.checked_mul(self.w)?.checked_add(x)
+    }
+
+    /// Convert a floating-point rectangle to inclusive pixel bounds clipped to
+    /// the mask. Invalid or wholly off-canvas rectangles produce no work.
+    #[inline]
+    fn pixel_bounds(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<(i32, i32, i32, i32)> {
+        if self.w == 0 || self.h == 0 {
+            return None;
+        }
+        let (x0, y0, x1, y1) = (x0.floor(), y0.floor(), x1.ceil(), y1.ceil());
+        let max_x = self.w.saturating_sub(1).min(i32::MAX as usize) as f32;
+        let max_y = self.h.saturating_sub(1).min(i32::MAX as usize) as f32;
+        if !x0.is_finite()
+            || !y0.is_finite()
+            || !x1.is_finite()
+            || !y1.is_finite()
+            || x0 > x1
+            || y0 > y1
+            || x1 < 0.0
+            || y1 < 0.0
+            || x0 > max_x
+            || y0 > max_y
+        {
+            return None;
+        }
+        let clip = |v: f32, max: f32| v.clamp(0.0, max) as i32;
+        Some((
+            clip(x0, max_x),
+            clip(y0, max_y),
+            clip(x1, max_x),
+            clip(y1, max_y),
+        ))
     }
 
     #[inline]
@@ -98,11 +136,24 @@ impl Mask {
     pub fn capsule(&mut self, a: (f32, f32), b: (f32, f32), radius: f32, hardness: f32, aa: bool) {
         let (ax, ay) = a;
         let (bx, by) = b;
+        if !ax.is_finite()
+            || !ay.is_finite()
+            || !bx.is_finite()
+            || !by.is_finite()
+            || !radius.is_finite()
+            || !hardness.is_finite()
+        {
+            return;
+        }
         let r = radius.max(0.15);
-        let x0 = (ax.min(bx) - r - 2.0).floor() as i32;
-        let x1 = (ax.max(bx) + r + 2.0).ceil() as i32;
-        let y0 = (ay.min(by) - r - 2.0).floor() as i32;
-        let y1 = (ay.max(by) + r + 2.0).ceil() as i32;
+        let Some((x0, y0, x1, y1)) = self.pixel_bounds(
+            ax.min(bx) - r - 2.0,
+            ay.min(by) - r - 2.0,
+            ax.max(bx) + r + 2.0,
+            ay.max(by) + r + 2.0,
+        ) else {
+            return;
+        };
         let inner = r * hardness.clamp(0.0, 0.999);
         let inv_soft = 1.0 / (r - inner).max(0.0015);
         for y in y0..=y1 {
@@ -138,16 +189,24 @@ impl Mask {
 
     /// Filled or stroked rectangle, coordinates in image space.
     pub fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, filled: bool) {
+        if !x0.is_finite()
+            || !y0.is_finite()
+            || !x1.is_finite()
+            || !y1.is_finite()
+            || !width.is_finite()
+        {
+            return;
+        }
         let (x0, y0, x1, y1) = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
         let cx = (x0 + x1) * 0.5;
         let cy = (y0 + y1) * 0.5;
         let hw = (x1 - x0) * 0.5;
         let hh = (y1 - y0) * 0.5;
         let pad = width * 0.5 + 2.0;
-        let ix0 = (x0 - pad).floor() as i32;
-        let ix1 = (x1 + pad).ceil() as i32;
-        let iy0 = (y0 - pad).floor() as i32;
-        let iy1 = (y1 + pad).ceil() as i32;
+        let Some((ix0, iy0, ix1, iy1)) = self.pixel_bounds(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+        else {
+            return;
+        };
         for y in iy0..=iy1 {
             let py = y as f32 + 0.5;
             for x in ix0..=ix1 {
@@ -171,12 +230,21 @@ impl Mask {
 
     /// Filled or stroked ellipse (centre + radii).
     pub fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, width: f32, filled: bool) {
+        if !cx.is_finite()
+            || !cy.is_finite()
+            || !rx.is_finite()
+            || !ry.is_finite()
+            || !width.is_finite()
+        {
+            return;
+        }
         let (rx, ry) = (rx.abs().max(0.4), ry.abs().max(0.4));
         let pad = width * 0.5 + 2.0;
-        let x0 = (cx - rx - pad).floor() as i32;
-        let x1 = (cx + rx + pad).ceil() as i32;
-        let y0 = (cy - ry - pad).floor() as i32;
-        let y1 = (cy + ry + pad).ceil() as i32;
+        let Some((x0, y0, x1, y1)) =
+            self.pixel_bounds(cx - rx - pad, cy - ry - pad, cx + rx + pad, cy + ry + pad)
+        else {
+            return;
+        };
         for y in y0..=y1 {
             let py = y as f32 + 0.5 - cy;
             for x in x0..=x1 {
@@ -209,7 +277,7 @@ impl Mask {
     /// Filled polygon using 4x supersampled scanlines with exact horizontal coverage.
     pub fn polygon_fill(&mut self, pts: &[(f32, f32)]) {
         let n = pts.len();
-        if n < 3 {
+        if n < 3 || pts.iter().any(|&(x, y)| !x.is_finite() || !y.is_finite()) {
             return;
         }
         let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
@@ -219,11 +287,28 @@ impl Mask {
             miny = miny.min(p.1);
             maxy = maxy.max(p.1);
         }
-        let bx0 = (minx - 1.0).floor() as i32;
-        let bx1 = (maxx + 1.0).ceil() as i32;
-        let by0 = (miny - 1.0).floor() as i32;
-        let by1 = (maxy + 1.0).ceil() as i32;
-        let bw = (bx1 - bx0).max(1) as usize;
+        let (mut bx0, mut bx1) = ((minx - 1.0).floor(), (maxx + 1.0).ceil());
+        let (mut by0, mut by1) = ((miny - 1.0).floor(), (maxy + 1.0).ceil());
+        let canvas_x1 = self.w.min(i32::MAX as usize) as f32;
+        let canvas_y1 = self.h.min(i32::MAX as usize) as f32;
+        if self.w == 0
+            || self.h == 0
+            || bx1 <= 0.0
+            || by1 <= 0.0
+            || bx0 >= canvas_x1
+            || by0 >= canvas_y1
+        {
+            return;
+        }
+        bx0 = bx0.max(0.0).min(canvas_x1);
+        bx1 = bx1.max(0.0).min(canvas_x1);
+        by0 = by0.max(0.0).min(canvas_y1);
+        by1 = by1.max(0.0).min(canvas_y1);
+        let (bx0, bx1, by0, by1) = (bx0 as i32, bx1 as i32, by0 as i32, by1 as i32);
+        if bx0 >= bx1 || by0 >= by1 {
+            return;
+        }
+        let bw = (bx1 - bx0) as usize;
         const SS: i32 = 4;
         let mut acc = vec![0f32; bw];
         let mut xs: Vec<f32> = Vec::with_capacity(16);
@@ -283,11 +368,29 @@ impl Mask {
 
     /// Copy an 8-bit coverage bitmap (fonts) into the mask.
     pub fn blit_cov(&mut self, ox: i32, oy: i32, w: usize, h: usize, cov: &[u8]) {
-        for y in 0..h {
-            for x in 0..w {
-                let v = cov[y * w + x];
+        let Some(len) = w.checked_mul(h) else {
+            return;
+        };
+        if cov.len() < len {
+            return;
+        }
+        for sy in 0..h {
+            let Some(sy_offset) = i32::try_from(sy).ok() else {
+                break;
+            };
+            let Some(dy) = oy.checked_add(sy_offset) else {
+                continue;
+            };
+            for sx in 0..w {
+                let Some(sx_offset) = i32::try_from(sx).ok() else {
+                    break;
+                };
+                let Some(dx) = ox.checked_add(sx_offset) else {
+                    continue;
+                };
+                let v = cov[sy * w + sx];
                 if v > 0 {
-                    self.put(ox + x as i32, oy + y as i32, v as f32 / 255.0);
+                    self.put(dx, dy, v as f32 / 255.0);
                 }
             }
         }
@@ -354,5 +457,39 @@ mod tests {
         let mut m = Mask::new(8192, 8192);
         m.disc(10.0, 10.0, 2.0, 1.0, false);
         assert!(m.d.len() < 64);
+    }
+
+    #[test]
+    fn out_of_bounds_pixels_are_ignored_without_overflow() {
+        let mut m = Mask::new(8, 8);
+        assert_eq!(m.get(-1, 1), 0);
+        assert_eq!(m.get(0, -1), 0);
+        m.put(-1, 0, 1.0);
+        m.add(0, -1, 1.0);
+        assert!(m.bbox().is_none());
+        m.disc(0.0, 0.0, 4.0, 1.0, true);
+        assert!(m.get(0, 0) > 0);
+        assert_eq!(m.get(7, 7), 0);
+    }
+
+    #[test]
+    fn extreme_strokes_are_clipped_before_iteration() {
+        let mut m = Mask::new(8, 8);
+        m.capsule(
+            (-100_000_000.0, 4.0),
+            (100_000_000.0, 4.0),
+            16.0,
+            1.0,
+            false,
+        );
+        assert!(m.get(0, 4) > 0);
+        assert!(m.get(7, 4) > 0);
+    }
+
+    #[test]
+    fn undersized_coverage_is_ignored() {
+        let mut m = Mask::new(8, 8);
+        m.blit_cov(0, 0, 2, 2, &[255, 255, 255]);
+        assert!(m.bbox().is_none());
     }
 }
