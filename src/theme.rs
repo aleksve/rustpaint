@@ -120,6 +120,8 @@ impl Theme {
         v.selection.bg_fill = self.accent_soft;
         v.selection.stroke = Stroke::new(1.0f32, self.accent);
         v.hyperlink_color = self.accent;
+        v.handle_shape = egui::style::HandleShape::Circle;
+        v.slider_trailing_fill = true;
 
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = self.panel;
@@ -215,7 +217,7 @@ mod tests {
         install_fonts(&ctx);
         apply(&ctx, &Theme::dark());
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ui.label("RustPaint • Ctrl ⇧ Z · 1280 × 800 — ✓ … ⠿");
+            ui.label("RustPaint • ⌘Z ⇧⌘S ⌥ ↵ Ctrl · 1280 × 800 — ✓ … °");
             ui.monospace("#1A1C22");
         });
         out.textures_delta.clear();

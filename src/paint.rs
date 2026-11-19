@@ -28,10 +28,483 @@ impl Floating {
 pub(crate) struct TextSession {
     pub pos: (f32, f32),
     pub text: String,
+    /// Active caret byte index into `text` (always on a UTF-8 boundary).
+    pub cursor: usize,
+    /// Selection anchor byte index into `text` (`anchor == cursor` => no selection).
+    pub anchor: usize,
+    /// Remembered x-offset (in image px) for consecutive Up/Down caret moves.
+    pub preferred_x: Option<f32>,
+    /// Active IME composition string rendered inline at `cursor` until committed.
+    pub preedit: String,
+    /// Input timestamp when the caret last moved or edited (resets blink phase).
+    pub blink_origin: f64,
     pub size: f32,
     pub bold: bool,
     pub family: String,
-    pub just_created: bool,
+    undoer: eframe::egui::util::undoer::Undoer<(String, usize, usize)>,
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn sanitize_text_input(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                let _ = chars.next();
+            }
+            out.push('\n');
+        } else if c == '\n' || c == '\t' || !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    let idx = s.floor_char_boundary(idx.min(s.len()));
+    s[..idx].char_indices().next_back().map_or(0, |(i, _)| i)
+}
+
+fn next_char_boundary(s: &str, idx: usize) -> usize {
+    let idx = s.floor_char_boundary(idx.min(s.len()));
+    s[idx..]
+        .chars()
+        .next()
+        .map_or(s.len(), |c| idx + c.len_utf8())
+}
+
+fn line_start_boundary(s: &str, idx: usize) -> usize {
+    let idx = s.floor_char_boundary(idx.min(s.len()));
+    s[..idx].rfind('\n').map_or(0, |p| p + 1)
+}
+
+fn line_end_boundary(s: &str, idx: usize) -> usize {
+    let idx = s.floor_char_boundary(idx.min(s.len()));
+    s[idx..].find('\n').map_or(s.len(), |off| idx + off)
+}
+
+fn prev_word_boundary(s: &str, idx: usize) -> usize {
+    let mut i = s.floor_char_boundary(idx.min(s.len()));
+    if i == 0 {
+        return 0;
+    }
+    // Step over a single newline if sitting right at a line start.
+    if s[..i].ends_with('\n') {
+        return i - 1;
+    }
+    while let Some((pi, ch)) = s[..i].char_indices().next_back() {
+        if ch == '\n' || !ch.is_whitespace() {
+            break;
+        }
+        i = pi;
+    }
+    let Some((_, last)) = s[..i].char_indices().next_back() else {
+        return 0;
+    };
+    if last == '\n' {
+        return i;
+    }
+    let want_word = is_word_char(last);
+    while let Some((pi, ch)) = s[..i].char_indices().next_back() {
+        if ch == '\n' || ch.is_whitespace() || is_word_char(ch) != want_word {
+            break;
+        }
+        i = pi;
+    }
+    i
+}
+
+fn next_word_boundary(s: &str, idx: usize) -> usize {
+    let mut i = s.floor_char_boundary(idx.min(s.len()));
+    if i >= s.len() {
+        return s.len();
+    }
+    if s[i..].starts_with('\n') {
+        return i + 1;
+    }
+    while let Some(ch) = s[i..].chars().next() {
+        if ch == '\n' || !ch.is_whitespace() {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    let Some(first) = s[i..].chars().next() else {
+        return s.len();
+    };
+    if first == '\n' {
+        return i;
+    }
+    let want_word = is_word_char(first);
+    while let Some(ch) = s[i..].chars().next() {
+        if ch == '\n' || ch.is_whitespace() || is_word_char(ch) != want_word {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
+impl TextSession {
+    pub fn new(pos: (f32, f32), size: f32, bold: bool, family: String, now: f64) -> Self {
+        let mut undoer = eframe::egui::util::undoer::Undoer::default();
+        undoer.add_undo(&(String::new(), 0, 0));
+        Self {
+            pos,
+            text: String::new(),
+            cursor: 0,
+            anchor: 0,
+            preferred_x: None,
+            preedit: String::new(),
+            blink_origin: now,
+            size,
+            bold,
+            family,
+            undoer,
+        }
+    }
+
+    pub fn feed_undo(&mut self, now: f64) {
+        if self.preedit.is_empty() {
+            let state = (self.text.clone(), self.cursor, self.anchor);
+            self.undoer.feed_state(now, &state);
+        }
+    }
+
+    pub fn checkpoint_undo(&mut self) {
+        if self.preedit.is_empty() {
+            let state = (self.text.clone(), self.cursor, self.anchor);
+            self.undoer.add_undo(&state);
+        }
+    }
+
+    pub fn undo_text(&mut self) -> bool {
+        let _ = self.commit_preedit();
+        let cur = (self.text.clone(), self.cursor, self.anchor);
+        if let Some((txt, c, a)) = self.undoer.undo(&cur).cloned() {
+            self.text = txt;
+            self.cursor = self.text.floor_char_boundary(c.min(self.text.len()));
+            self.anchor = self.text.floor_char_boundary(a.min(self.text.len()));
+            self.preferred_x = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn redo_text(&mut self) -> bool {
+        let _ = self.commit_preedit();
+        let cur = (self.text.clone(), self.cursor, self.anchor);
+        if let Some((txt, c, a)) = self.undoer.redo(&cur).cloned() {
+            self.text = txt;
+            self.cursor = self.text.floor_char_boundary(c.min(self.text.len()));
+            self.anchor = self.text.floor_char_boundary(a.min(self.text.len()));
+            self.preferred_x = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.preedit.is_empty()
+    }
+
+    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        let a = self
+            .text
+            .floor_char_boundary(self.anchor.min(self.text.len()));
+        let b = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        (a != b).then(|| a.min(b)..a.max(b))
+    }
+
+    pub fn selected_text(&self) -> &str {
+        self.selection_range()
+            .map_or("", |r| &self.text[r.start..r.end])
+    }
+
+    /// Return `(rendered_text, display_caret_byte, preedit_byte_range)`.
+    pub fn display_text(
+        &self,
+    ) -> (
+        std::borrow::Cow<'_, str>,
+        usize,
+        Option<std::ops::Range<usize>>,
+    ) {
+        let cur = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        if self.preedit.is_empty() {
+            return (std::borrow::Cow::Borrowed(&self.text), cur, None);
+        }
+        let mut combined = String::with_capacity(self.text.len() + self.preedit.len());
+        combined.push_str(&self.text[..cur]);
+        let start = combined.len();
+        combined.push_str(&self.preedit);
+        let end = combined.len();
+        combined.push_str(&self.text[cur..]);
+        (std::borrow::Cow::Owned(combined), end, Some(start..end))
+    }
+
+    pub fn set_cursor(&mut self, idx: usize, extend: bool, keep_preferred_x: bool) {
+        let idx = self.text.floor_char_boundary(idx.min(self.text.len()));
+        self.cursor = idx;
+        if !extend {
+            self.anchor = idx;
+        }
+        if !keep_preferred_x {
+            self.preferred_x = None;
+        }
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        self.text.replace_range(range.clone(), "");
+        self.cursor = range.start;
+        self.anchor = range.start;
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn insert_str(&mut self, raw: &str) -> bool {
+        let clean = sanitize_text_input(raw);
+        let had_preedit = !self.preedit.is_empty();
+        self.preedit.clear();
+        let deleted = self.delete_selection();
+        if clean.is_empty() {
+            return deleted || had_preedit;
+        }
+        let at = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        self.text.insert_str(at, &clean);
+        let next = at + clean.len();
+        self.cursor = next;
+        self.anchor = next;
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn set_preedit(&mut self, raw: &str) -> bool {
+        let clean = sanitize_text_input(raw);
+        if clean.is_empty() && self.preedit.is_empty() {
+            return false;
+        }
+        let deleted = if !clean.is_empty() {
+            self.delete_selection()
+        } else {
+            false
+        };
+        if self.preedit == clean && !deleted {
+            return false;
+        }
+        self.preedit = clean;
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn commit_preedit(&mut self) -> bool {
+        if self.preedit.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.preedit);
+        self.insert_str(&pending)
+    }
+
+    pub fn delete_surrounding_chars(&mut self, before: usize, after: usize) -> bool {
+        if before == 0 && after == 0 {
+            return false;
+        }
+        let _ = self.delete_selection();
+        let cur = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        let mut start = cur;
+        for _ in 0..before {
+            start = prev_char_boundary(&self.text, start);
+        }
+        let mut end = cur;
+        for _ in 0..after {
+            end = next_char_boundary(&self.text, end);
+        }
+        if start == end {
+            return false;
+        }
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.anchor = start;
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn backspace(&mut self, by_word: bool, to_line_start: bool) -> bool {
+        if !self.preedit.is_empty() {
+            self.preedit.pop();
+            return true;
+        }
+        if self.delete_selection() {
+            return true;
+        }
+        let cur = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        if cur == 0 {
+            return false;
+        }
+        let start = if to_line_start {
+            let ls = line_start_boundary(&self.text, cur);
+            if ls < cur {
+                ls
+            } else {
+                prev_char_boundary(&self.text, cur)
+            }
+        } else if by_word {
+            prev_word_boundary(&self.text, cur)
+        } else {
+            prev_char_boundary(&self.text, cur)
+        };
+        self.text.replace_range(start..cur, "");
+        self.cursor = start;
+        self.anchor = start;
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn delete_forward(&mut self, by_word: bool, to_line_end: bool) -> bool {
+        if !self.preedit.is_empty() {
+            self.preedit.clear();
+            return true;
+        }
+        if self.delete_selection() {
+            return true;
+        }
+        let cur = self
+            .text
+            .floor_char_boundary(self.cursor.min(self.text.len()));
+        if cur >= self.text.len() {
+            return false;
+        }
+        let end = if to_line_end {
+            let le = line_end_boundary(&self.text, cur);
+            if le > cur {
+                le
+            } else {
+                next_char_boundary(&self.text, cur)
+            }
+        } else if by_word {
+            next_word_boundary(&self.text, cur)
+        } else {
+            next_char_boundary(&self.text, cur)
+        };
+        self.text.replace_range(cur..end, "");
+        self.preferred_x = None;
+        true
+    }
+
+    pub fn move_left(&mut self, extend: bool, by_word: bool, to_line_start: bool) {
+        self.commit_preedit();
+        if !extend
+            && let Some(range) = self.selection_range()
+            && !by_word
+            && !to_line_start
+        {
+            self.set_cursor(range.start, false, false);
+            return;
+        }
+        let target = if to_line_start {
+            line_start_boundary(&self.text, self.cursor)
+        } else if by_word {
+            prev_word_boundary(&self.text, self.cursor)
+        } else {
+            prev_char_boundary(&self.text, self.cursor)
+        };
+        self.set_cursor(target, extend, false);
+    }
+
+    pub fn move_right(&mut self, extend: bool, by_word: bool, to_line_end: bool) {
+        self.commit_preedit();
+        if !extend
+            && let Some(range) = self.selection_range()
+            && !by_word
+            && !to_line_end
+        {
+            self.set_cursor(range.end, false, false);
+            return;
+        }
+        let target = if to_line_end {
+            line_end_boundary(&self.text, self.cursor)
+        } else if by_word {
+            next_word_boundary(&self.text, self.cursor)
+        } else {
+            next_char_boundary(&self.text, self.cursor)
+        };
+        self.set_cursor(target, extend, false);
+    }
+
+    pub fn select_all(&mut self) {
+        self.commit_preedit();
+        self.anchor = 0;
+        self.cursor = self.text.len();
+        self.preferred_x = None;
+    }
+
+    pub fn select_word_at(&mut self, idx: usize) {
+        self.commit_preedit();
+        let idx = self.text.floor_char_boundary(idx.min(self.text.len()));
+        let ls = line_start_boundary(&self.text, idx);
+        let le = line_end_boundary(&self.text, idx);
+        let line = &self.text[ls..le];
+        let rel = idx - ls;
+        let probe = line[rel..]
+            .chars()
+            .next()
+            .or_else(|| line[..rel].chars().next_back());
+        let Some(ch) = probe else {
+            self.set_cursor(idx, false, false);
+            return;
+        };
+        let cls = |c: char| -> u8 {
+            if is_word_char(c) {
+                1
+            } else if c.is_whitespace() {
+                2
+            } else {
+                3
+            }
+        };
+        let target_cls = cls(ch);
+        let mut start = rel;
+        while let Some((pi, pc)) = line[..start].char_indices().next_back() {
+            if cls(pc) != target_cls {
+                break;
+            }
+            start = pi;
+        }
+        let mut end = rel;
+        while let Some(nc) = line[end..].chars().next() {
+            if cls(nc) != target_cls {
+                break;
+            }
+            end += nc.len_utf8();
+        }
+        self.anchor = ls + start;
+        self.cursor = ls + end;
+        self.preferred_x = None;
+    }
+
+    pub fn select_line_at(&mut self, idx: usize) {
+        self.commit_preedit();
+        self.anchor = line_start_boundary(&self.text, idx);
+        self.cursor = line_end_boundary(&self.text, idx);
+        self.preferred_x = None;
+    }
 }
 
 /// Mode-specific state owned directly by `Session` so mode payloads (such as a
@@ -68,7 +541,7 @@ pub(crate) enum SessionKind {
     },
     /// Live text being typed or repositioned on the canvas.
     Text {
-        data: TextSession,
+        data: Box<TextSession>,
         mask: Mask,
         color: Color32,
         opacity: f32,
@@ -325,6 +798,12 @@ impl App {
 
     /// Finish whatever edit is in flight (stroke, shape, polygon, text, move).
     pub(crate) fn commit_current(&mut self) {
+        if self
+            .text_session_mut()
+            .is_some_and(TextSession::commit_preedit)
+        {
+            self.refresh_text();
+        }
         if let Some(s) = self.edit.session.take() {
             if let SessionKind::Move { floating, .. } = &s.kind {
                 self.edit.selection = Some(floating.rect());
@@ -347,7 +826,7 @@ impl App {
                 }
             }
         }
-        self.edit.text_editor_rect = None;
+        self.edit.clear_text_ui();
         self.edit.move_float_origin = None;
         self.edit.last_drag_input = None;
         self.edit.last_polygon_hover = None;
@@ -375,7 +854,7 @@ impl App {
                 self.edit.selection = original;
             }
         }
-        self.edit.text_editor_rect = None;
+        self.edit.clear_text_ui();
         self.edit.move_float_origin = None;
         self.edit.last_drag_input = None;
         self.edit.last_polygon_hover = None;
@@ -643,26 +1122,7 @@ impl App {
                 }
             }
             Tool::Text => {
-                self.commit_current();
-                let mask = Mask::new(self.doc.w, self.doc.h);
-                let data = TextSession {
-                    pos: (img.x, img.y),
-                    text: String::new(),
-                    size: self.opts.font_size,
-                    bold: self.opts.bold,
-                    family: self.opts.font_family.clone(),
-                    just_created: true,
-                };
-                let clip = self.edit.selection;
-                let opacity = self.opts.opacity;
-                self.begin_session(SessionKind::Text {
-                    data,
-                    mask,
-                    color,
-                    opacity,
-                    prev_bbox: None,
-                    clip,
-                });
+                self.start_text_session(img, 0.0, false);
             }
             Tool::Polygon => {
                 let already_open = matches!(
@@ -970,6 +1430,56 @@ impl App {
         }
     }
 
+    /// Begin a new focused canvas text session at `img`. When `center_line` is
+    /// true, the first line is vertically centred on the I-beam hotspot.
+    pub(crate) fn start_text_session(&mut self, img: Pos2, now: f64, center_line: bool) {
+        self.commit_current();
+        let family = self.opts.font_family.clone();
+        let bold = self.opts.bold;
+        let size = self.opts.font_size;
+        self.text_engine.set_style(&mut self.fonts, &family, bold);
+        let y_shift = if center_line {
+            self.text_engine.line_height(size) * 0.5
+        } else {
+            0.0
+        };
+        let max_x = self.doc.w.saturating_sub(4) as f32;
+        let max_y = self.doc.h.saturating_sub(4) as f32;
+        let pos = (img.x.clamp(0.0, max_x), (img.y - y_shift).clamp(0.0, max_y));
+        let mask = Mask::new(self.doc.w, self.doc.h);
+        let data = TextSession::new(pos, size, bold, family, now);
+        let color = self.active_color(Btn::Primary);
+        let clip = self.edit.selection;
+        let opacity = self.opts.opacity;
+        self.begin_session(SessionKind::Text {
+            data: Box::new(data),
+            mask,
+            color,
+            opacity,
+            prev_bbox: None,
+            clip,
+        });
+    }
+
+    /// Move an empty live text session to a fresh I-beam click location while
+    /// keeping keyboard focus active.
+    pub(crate) fn reposition_empty_text(&mut self, img: Pos2, now: f64) {
+        let Some((family, bold, size)) = self
+            .text_session()
+            .map(|t| (t.family.clone(), t.bold, t.size))
+        else {
+            return;
+        };
+        self.text_engine.set_style(&mut self.fonts, &family, bold);
+        let y_shift = self.text_engine.line_height(size) * 0.5;
+        let max_x = self.doc.w.saturating_sub(4) as f32;
+        let max_y = self.doc.h.saturating_sub(4) as f32;
+        if let Some(live) = self.text_session_mut() {
+            live.pos = (img.x.clamp(0.0, max_x), (img.y - y_shift).clamp(0.0, max_y));
+            live.blink_origin = now;
+        }
+    }
+
     pub(crate) fn text_session(&self) -> Option<&TextSession> {
         match self.edit.session.as_ref().map(|s| &s.kind) {
             Some(SessionKind::Text { data, .. }) => Some(data),
@@ -982,6 +1492,26 @@ impl App {
             Some(SessionKind::Text { data, .. }) => Some(data),
             _ => None,
         }
+    }
+
+    pub(crate) fn text_color(&self) -> Option<Color32> {
+        match self.edit.session.as_ref().map(|s| &s.kind) {
+            Some(SessionKind::Text { color, .. }) => Some(*color),
+            _ => None,
+        }
+    }
+
+    /// Compute the exact glyph/caret layout for the active text session
+    /// (including any in-progress IME composition string).
+    pub(crate) fn text_layout(&mut self) -> Option<crate::text::TextLayout> {
+        let (size, bold, family) = {
+            let data = self.text_session()?;
+            (data.size, data.bold, data.family.clone())
+        };
+        self.text_engine.set_style(&mut self.fonts, &family, bold);
+        let data = self.text_session()?;
+        let (rendered, _, _) = data.display_text();
+        Some(self.text_engine.layout(&rendered, size))
     }
 
     pub(crate) fn sync_live_text_color_and_opacity(&mut self) {
@@ -1032,21 +1562,14 @@ impl App {
         }) = self.edit.session.as_mut()
         {
             mask.clear();
-            if !data.text.is_empty() {
-                self.text_engine.draw(mask, &data.text, x, y, size);
+            let (rendered, _, _) = data.display_text();
+            if !rendered.is_empty() {
+                self.text_engine.draw(mask, &rendered, x, y, size);
             }
         } else {
             return;
         }
         self.refresh_masked();
-    }
-
-    /// Return the painted bounds of the live text, with a small grab margin.
-    pub(crate) fn text_hit_rect(&self) -> Option<IRect> {
-        let SessionKind::Text { mask, .. } = &self.edit.session.as_ref()?.kind else {
-            return None;
-        };
-        Some(mask.bbox()?.expand(6))
     }
 
     /// Move the live text by one frame's screen-space drag delta, keeping its

@@ -348,6 +348,7 @@ impl FileDialog {
                 let resp = ui.add_sized(
                     Vec2::new(w, 28.0),
                     egui::TextEdit::singleline(&mut self.path_edit)
+                        .desired_width(w)
                         .font(FontId::proportional(12.0)),
                 );
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -510,6 +511,7 @@ impl FileDialog {
                 let name_resp = ui.add_sized(
                     Vec2::new(w, 28.0),
                     egui::TextEdit::singleline(&mut self.name)
+                        .desired_width(w)
                         .hint_text(if self.mode == Mode::Save {
                             "image.png"
                         } else {

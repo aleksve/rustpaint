@@ -113,7 +113,11 @@ impl Tool {
     pub fn hint(self) -> &'static str {
         match self {
             Tool::Select => {
-                "Drag to select · drag inside to move · Ctrl+C / Ctrl+V to copy & paste"
+                if cfg!(target_os = "macos") {
+                    "Drag to select · drag inside to move · ⌘C / ⌘V to copy & paste"
+                } else {
+                    "Drag to select · drag inside to move · Ctrl+C / Ctrl+V to copy & paste"
+                }
             }
             Tool::Pencil => "Hard-edged pixel drawing",
             Tool::Brush => "Round brush with adjustable hardness and anti-aliasing",
@@ -121,7 +125,13 @@ impl Tool {
             Tool::Airbrush => "Spray paint, hold still to build up",
             Tool::Fill => "Fill a contiguous area of similar colour",
             Tool::Picker => "Pick a colour from the canvas",
-            Tool::Text => "Click to place text, type, then click Apply or press Ctrl+Enter",
+            Tool::Text => {
+                if cfg!(target_os = "macos") {
+                    "Click and type · Enter for new line · ⌘↵ or click outside to apply"
+                } else {
+                    "Click and type · Enter for new line · Ctrl+Enter or click outside to apply"
+                }
+            }
             Tool::Line => "Drag for a straight line (Shift = 45° steps)",
             Tool::Rect => "Drag a rectangle (Shift = square)",
             Tool::Ellipse => "Drag an ellipse (Shift = circle)",

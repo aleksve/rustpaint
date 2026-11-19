@@ -112,8 +112,8 @@ impl History {
         self.undo.len()
     }
 
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
     }
 
     fn alloc_state(&mut self) -> u64 {

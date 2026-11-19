@@ -9,19 +9,19 @@ use crate::app::{App, Btn};
 use crate::icons;
 use crate::paint::TexDirty;
 use crate::tools::Tool;
-use crate::widgets;
+use crate::widgets::{self, rr};
 
 impl App {
-    pub(crate) fn canvas(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn canvas(&mut self, ui: &mut egui::Ui) -> Rect {
         let th = self.theme;
         let dark = th.is_dark();
         let blocked = self.modal_open();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(th.canvas_bg))
             .show(ui, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                let rect = ui.available_rect_before_wrap();
                 self.last_view_rect = rect;
+                let response = ui.allocate_rect(rect, Sense::click_and_drag());
 
                 if self.view.fit_pending && rect.width() > 32.0 && rect.height() > 32.0 {
                     self.fit_view(rect);
@@ -53,23 +53,18 @@ impl App {
 
                 let painter = ui.painter().with_clip_rect(rect);
 
-                // Subtle drop shadow behind the canvas.
+                // Subtle rounded drop shadow framing the canvas.
                 painter.rect_filled(
-                    canvas_rect.expand(4.0).translate(Vec2::new(0.0, 5.0)),
-                    CornerRadius::ZERO,
-                    Color32::from_black_alpha(if dark { 95 } else { 32 }),
-                );
-                painter.rect_filled(
-                    canvas_rect.expand(1.0),
-                    CornerRadius::ZERO,
-                    Color32::from_black_alpha(if dark { 55 } else { 18 }),
+                    canvas_rect.expand(8.0),
+                    rr(6),
+                    Color32::from_black_alpha(if dark { 110 } else { 34 }),
                 );
 
                 // Hardware-repeated 2×2 checkerboard texture (single quad regardless of
-                // canvas size or zoom level).
+                // canvas size or zoom level; 8 pt squares = 16 pt 2×2 period).
                 let checker_id = self.ensure_checker_texture(ui.ctx());
                 if visible.is_positive() {
-                    let period = 24.0;
+                    let period = 16.0;
                     let u0 = (visible.min.x - canvas_rect.min.x) / period;
                     let v0 = (visible.min.y - canvas_rect.min.y) / period;
                     let u1 = (visible.max.x - canvas_rect.min.x) / period;
@@ -142,37 +137,6 @@ impl App {
                     );
                 }
 
-                // Viewport-clipped pixel grid at high zoom.
-                if self.view.grid && zoom >= 8.0 && visible.is_positive() {
-                    let grid_color =
-                        Color32::from_rgba_unmultiplied(128, 128, 140, if dark { 45 } else { 55 });
-                    let stroke = Stroke::new(1.0_f32, grid_color);
-                    let x0 = (((visible.min.x - canvas_rect.min.x) / zoom).ceil() as usize).max(1);
-                    let x1 = (((visible.max.x - canvas_rect.min.x) / zoom).floor() as usize)
-                        .min(self.doc.w.saturating_sub(1));
-                    if x0 <= x1 {
-                        for x in x0..=x1 {
-                            let sx = canvas_rect.min.x + x as f32 * zoom;
-                            painter.line_segment(
-                                [Pos2::new(sx, visible.min.y), Pos2::new(sx, visible.max.y)],
-                                stroke,
-                            );
-                        }
-                    }
-                    let y0 = (((visible.min.y - canvas_rect.min.y) / zoom).ceil() as usize).max(1);
-                    let y1 = (((visible.max.y - canvas_rect.min.y) / zoom).floor() as usize)
-                        .min(self.doc.h.saturating_sub(1));
-                    if y0 <= y1 {
-                        for y in y0..=y1 {
-                            let sy = canvas_rect.min.y + y as f32 * zoom;
-                            painter.line_segment(
-                                [Pos2::new(visible.min.x, sy), Pos2::new(visible.max.x, sy)],
-                                stroke,
-                            );
-                        }
-                    }
-                }
-
                 // Crisp border around the canvas.
                 painter.rect_stroke(
                     canvas_rect,
@@ -181,18 +145,48 @@ impl App {
                     StrokeKind::Outside,
                 );
 
+                // Viewport-clipped pixel grid at high zoom.
+                if self.view.grid && zoom >= 6.0 && visible.is_positive() {
+                    let grid_color = Color32::from_black_alpha(if dark { 70 } else { 40 });
+                    let stroke = Stroke::new(1.0_f32, grid_color);
+                    let x0 = (((visible.min.x - origin.x) / zoom).ceil() as usize).max(1);
+                    let x1 = (((visible.max.x - origin.x) / zoom).floor() as usize)
+                        .min(self.doc.w.saturating_sub(1));
+                    if x0 <= x1 {
+                        for x in x0..=x1 {
+                            let sx = origin.x + x as f32 * zoom;
+                            painter.line_segment(
+                                [Pos2::new(sx, visible.min.y), Pos2::new(sx, visible.max.y)],
+                                stroke,
+                            );
+                        }
+                    }
+                    let y0 = (((visible.min.y - origin.y) / zoom).ceil() as usize).max(1);
+                    let y1 = (((visible.max.y - origin.y) / zoom).floor() as usize)
+                        .min(self.doc.h.saturating_sub(1));
+                    if y0 <= y1 {
+                        for y in y0..=y1 {
+                            let sy = origin.y + y as f32 * zoom;
+                            painter.line_segment(
+                                [Pos2::new(visible.min.x, sy), Pos2::new(visible.max.x, sy)],
+                                stroke,
+                            );
+                        }
+                    }
+                }
+
                 // Marching ants around an active selection (clipped to viewport via `painter`).
-                if let Some(selection) = self.edit.selection
-                    && !selection.is_empty()
-                {
-                    let selection_rect = Rect::from_min_max(
-                        origin + Vec2::new(selection.x0 as f32, selection.y0 as f32) * zoom,
-                        origin + Vec2::new(selection.x1 as f32, selection.y1 as f32) * zoom,
-                    );
-                    let phase = (ui.input(|i| i.time) * 14.0) as f32;
-                    icons::marching_ants(&painter, selection_rect, phase, dark);
-                    // Low-frequency animation timer (~16 Hz) only while ants are visible.
-                    ui.ctx().request_repaint_after_secs(0.06);
+                if let Some(selection) = self.edit.selection {
+                    let selection = selection.clamp(self.doc.w as i32, self.doc.h as i32);
+                    if !selection.is_empty() {
+                        let selection_rect = Rect::from_min_max(
+                            origin + Vec2::new(selection.x0 as f32, selection.y0 as f32) * zoom,
+                            origin + Vec2::new(selection.x1 as f32, selection.y1 as f32) * zoom,
+                        );
+                        let phase = (ui.input(|i| i.time) * 28.0) as f32;
+                        icons::marching_ants(&painter, selection_rect, phase, dark);
+                        ui.ctx().request_repaint_after_secs(0.06);
+                    }
                 }
 
                 // Polygon construction vertices.
@@ -233,7 +227,9 @@ impl App {
                         Stroke::new(1.0_f32, Color32::from_white_alpha(210)),
                     );
                 }
-            });
+            })
+            .response
+            .rect
     }
 
     fn ensure_checker_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
@@ -271,7 +267,8 @@ impl App {
             return;
         }
 
-        let typing = ui.ctx().egui_wants_keyboard_input();
+        let ctx = ui.ctx().clone();
+        let typing = ctx.egui_wants_keyboard_input() || self.edit.is_editing_text();
         let space = !typing && ui.input(|i| i.key_down(Key::Space));
         self.space_pan = space;
 
@@ -282,10 +279,13 @@ impl App {
             middle_down,
             primary_pressed,
             secondary_pressed,
+            double_clicked,
+            triple_clicked,
             shift,
             alt,
             delta,
             dt,
+            now,
         ) = ui.input(|i| {
             (
                 i.pointer.interact_pos(),
@@ -294,21 +294,33 @@ impl App {
                 i.pointer.button_down(PointerButton::Middle),
                 i.pointer.button_pressed(PointerButton::Primary),
                 i.pointer.button_pressed(PointerButton::Secondary),
+                i.pointer.button_double_clicked(PointerButton::Primary),
+                i.pointer.button_triple_clicked(PointerButton::Primary),
                 i.modifiers.shift,
                 i.modifiers.alt,
                 i.pointer.delta(),
                 i.unstable_dt,
+                i.time,
             )
         });
 
+        let over_text_bar = pointer.is_some_and(|p| {
+            self.edit
+                .text_toolbar_rect
+                .is_some_and(|bar| bar.contains(p))
+        });
+        let over_text_inner = !over_text_bar
+            && pointer.is_some_and(|p| self.edit.text_box_rect.is_some_and(|r| r.contains(p)));
+        let over_text_border = !over_text_bar
+            && !over_text_inner
+            && pointer.is_some_and(|p| {
+                self.edit
+                    .text_box_rect
+                    .is_some_and(|r| r.expand(9.0).contains(p))
+            });
+
         let panning = self.tool == Tool::Pan || space || middle_down;
-        if response.hovered() {
-            let over_text = self.edit.is_editing_text()
-                && pointer.is_some_and(|p| {
-                    let img = self.screen_to_image(p);
-                    self.text_hit_rect()
-                        .is_some_and(|r| r.contains(img.x.floor() as i32, img.y.floor() as i32))
-                });
+        if response.hovered() && !over_text_bar {
             let over_float_or_sel = self.tool == Tool::Select
                 && !shift
                 && pointer.is_some_and(|p| {
@@ -323,7 +335,14 @@ impl App {
                 } else {
                     CursorIcon::Grab
                 }
-            } else if over_text || over_float_or_sel {
+            } else if self.edit.is_editing_text() {
+                match self.edit.text_drag {
+                    crate::app::transient::TextDrag::Move => CursorIcon::Grabbing,
+                    crate::app::transient::TextDrag::Select => CursorIcon::Text,
+                    _ if over_text_border => CursorIcon::Move,
+                    _ => CursorIcon::Text,
+                }
+            } else if over_float_or_sel {
                 if primary_down {
                     CursorIcon::Grabbing
                 } else {
@@ -334,11 +353,14 @@ impl App {
             } else {
                 CursorIcon::Crosshair
             };
-            ui.ctx().set_cursor_icon(icon);
+            ctx.set_cursor_icon(icon);
         }
 
         // Always honour button release before pan short-circuit so pressing Space
         // mid-stroke cannot leave `self.edit.dragging` stranded.
+        if !primary_down {
+            self.edit.text_drag = crate::app::transient::TextDrag::None;
+        }
         if let Some(button) = self.edit.dragging {
             let still_down = match button {
                 Btn::Primary => primary_down,
@@ -362,6 +384,103 @@ impl App {
             return;
         }
 
+        // Dedicated pointer handling for live on-canvas text editing (caret
+        // placement, double/triple-click, drag-selection, border move, and
+        // click-outside-to-apply).
+        if self.edit.is_editing_text() {
+            use crate::app::transient::TextDrag;
+            match self.edit.text_drag {
+                TextDrag::Move => {
+                    if primary_down && delta != Vec2::ZERO {
+                        self.move_text_by(delta);
+                    }
+                    return;
+                }
+                TextDrag::Select => {
+                    if primary_down && let Some(pos) = pointer {
+                        let img = self.screen_to_image(pos);
+                        if let Some(origin) = self.text_session().map(|t| t.pos)
+                            && let Some(layout) = self.text_layout()
+                            && let Some(live) = self.text_session_mut()
+                        {
+                            let idx = layout.hit_test(img.x - origin.0, img.y - origin.1);
+                            live.set_cursor(idx, true, false);
+                            live.blink_origin = now;
+                        }
+                    }
+                    return;
+                }
+                TextDrag::Swallowed => return,
+                TextDrag::None => {}
+            }
+
+            if response.hovered()
+                && !over_text_bar
+                && primary_pressed
+                && let Some(pos) = pointer
+            {
+                self.focus_canvas_text(&ctx);
+                if over_text_inner {
+                    if self
+                        .text_session_mut()
+                        .is_some_and(crate::paint::TextSession::commit_preedit)
+                    {
+                        self.refresh_text();
+                    }
+                    let img = self.screen_to_image(pos);
+                    if let Some(origin) = self.text_session().map(|t| t.pos)
+                        && let Some(layout) = self.text_layout()
+                        && let Some(live) = self.text_session_mut()
+                    {
+                        let idx = layout.hit_test(img.x - origin.0, img.y - origin.1);
+                        let next_drag = if triple_clicked {
+                            live.select_line_at(idx);
+                            TextDrag::Swallowed
+                        } else if double_clicked {
+                            live.select_word_at(idx);
+                            TextDrag::Swallowed
+                        } else {
+                            live.set_cursor(idx, shift, false);
+                            TextDrag::Select
+                        };
+                        live.blink_origin = now;
+                        self.edit.text_drag = next_drag;
+                    }
+                } else if over_text_border {
+                    self.edit.text_drag = TextDrag::Move;
+                } else if self.text_session().is_some_and(|t| t.is_empty()) {
+                    let img = self.screen_to_image(pos);
+                    self.reposition_empty_text(img, now);
+                    self.edit.text_drag = TextDrag::Swallowed;
+                } else {
+                    self.commit_current();
+                    self.edit.text_drag = TextDrag::Swallowed;
+                }
+            }
+            return;
+        }
+
+        // Prevent the tail of a click that just committed text from spawning a
+        // new box while the button is still held.
+        if self.edit.text_drag == crate::app::transient::TextDrag::Swallowed {
+            return;
+        }
+
+        // Clicking with the Text tool starts a focused session immediately so
+        // the very next keystroke types straight onto the canvas.
+        if self.tool == Tool::Text {
+            if response.hovered()
+                && primary_pressed
+                && let Some(pos) = pointer
+            {
+                self.focus_canvas_text(&ctx);
+                let img = self.screen_to_image(pos);
+                self.start_text_session(img, now, true);
+                self.edit.text_drag = crate::app::transient::TextDrag::Swallowed;
+            }
+            return;
+        }
+
         // Polygon tool finishes on double-click or right-click.
         if self.tool == Tool::Polygon && self.edit.is_drawing_polygon() {
             if response.double_clicked() || (response.hovered() && secondary_pressed) {
@@ -377,35 +496,7 @@ impl App {
             }
         }
 
-        // Ignore clicks that land on the floating text bar/editor itself.
-        let over_editor = pointer.is_some_and(|point| {
-            self.edit
-                .text_editor_rect
-                .is_some_and(|editor| editor.contains(point))
-        });
-
-        // Allow dragging painted text directly on the canvas too.
-        if self.edit.is_editing_text() && !over_editor {
-            if response.drag_started_by(PointerButton::Primary)
-                && let Some(pos) = pointer
-            {
-                let img = self.screen_to_image(pos);
-                if self
-                    .text_hit_rect()
-                    .is_some_and(|r| r.contains(img.x.floor() as i32, img.y.floor() as i32))
-                {
-                    self.edit.dragging = Some(Btn::Primary);
-                }
-            }
-            if self.edit.dragging == Some(Btn::Primary) {
-                if delta != Vec2::ZERO {
-                    self.move_text_by(delta);
-                }
-                return;
-            }
-        }
-
-        if response.hovered() && !over_editor && self.edit.dragging.is_none() {
+        if response.hovered() && self.edit.dragging.is_none() {
             let pressed_button = if primary_pressed {
                 Some(Btn::Primary)
             } else if secondary_pressed {

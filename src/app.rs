@@ -81,6 +81,7 @@ pub struct App {
     pub(crate) hex_edit: String,
     pub(crate) hex_focused: bool,
     pub(crate) font_filter: String,
+    pub(crate) font_filter_focused: bool,
     pub(crate) tool_sizes: HashMap<Tool, f32>,
 
     pub(crate) view: View,
@@ -161,7 +162,7 @@ impl App {
     ) -> Self {
         let colors = Colors::default();
         let hex_edit = to_hex(colors.primary);
-        let hsva = egui::ecolor::Hsva::from_srgb([
+        let hsv = crate::widgets::srgb_to_hsv([
             colors.primary.r(),
             colors.primary.g(),
             colors.primary.b(),
@@ -184,12 +185,13 @@ impl App {
             hist: History::new(HISTORY_LIMIT, HISTORY_MAX_BYTES),
             tool: Tool::Brush,
             opts,
-            picker_hsv: (colors.primary, [hsva.h, hsva.s, hsva.v]),
+            picker_hsv: (colors.primary, hsv),
             colors,
             color_target: Btn::Primary,
             hex_edit,
             hex_focused: false,
             font_filter: String::new(),
+            font_filter_focused: false,
             tool_sizes,
             view: View::default(),
             origin: Pos2::ZERO,
@@ -278,12 +280,26 @@ impl App {
         self.dialog.is_some() || self.file_dialog.is_some() || self.io_job.is_some()
     }
 
-    pub(crate) fn theme_for_prefs(&self) -> Theme {
-        if self.prefs.theme_dark {
-            Theme::dark()
-        } else {
-            Theme::light()
-        }
+    /// True when the active on-canvas text session owns keyboard & IME input
+    /// (i.e. text editing is open, no modal dialog is active, and neither the
+    /// sidebar `Hex` field nor the font search field has focus).
+    pub(crate) fn canvas_text_captures_keys(&self) -> bool {
+        self.edit.is_editing_text()
+            && !self.modal_open()
+            && !self.hex_focused
+            && !self.font_filter_focused
+    }
+
+    /// Return keyboard focus from any sidebar field back to the canvas text
+    /// session immediately when clicking/placing text on the canvas.
+    pub(crate) fn focus_canvas_text(&mut self, ctx: &Context) {
+        self.hex_focused = false;
+        self.font_filter_focused = false;
+        ctx.memory_mut(|mem| {
+            if let Some(id) = mem.focused() {
+                mem.surrender_focus(id);
+            }
+        });
     }
 
     fn update_title(&mut self, ctx: &Context) {
@@ -343,16 +359,27 @@ impl eframe::App for App {
         self.handle_file_drop(&ctx);
         shortcuts::handle(self, &ctx, Some(frame));
 
-        self.top_bar(ui, Some(frame));
-        self.status_bar(ui);
-        self.tool_dock(ui);
-        self.right_panel(ui);
-        self.canvas(ui);
+        let _ = self.top_bar(ui, Some(frame));
+        let _ = self.status_bar(ui);
+        let _ = self.tool_rail(ui);
+        let _ = self.side_panel(ui);
+        let _ = self.canvas(ui);
         self.overlays(&ctx, Some(frame));
 
         if let Some(color) = self.picked_color.take() {
             self.hex_edit = to_hex(color);
         }
+    }
+}
+
+pub(crate) fn elide(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_owned()
+    } else {
+        let take = max_chars.saturating_sub(1);
+        let mut out: String = s.chars().take(take).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -582,12 +609,35 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| {
-                app.top_bar(ui, None);
-                app.status_bar(ui);
-                app.tool_dock(ui);
-                app.right_panel(ui);
-                app.canvas(ui);
+                let top = app.top_bar(ui, None);
+                let bottom = app.status_bar(ui);
+                let left = app.tool_rail(ui);
+                let right = app.side_panel(ui);
+                let center = app.canvas(ui);
                 app.overlays(ui.ctx(), None);
+
+                // Regression check: right and bottom panels must keep their exact
+                // reserved edges and the central canvas must never overlap any panel.
+                assert!((top.bottom() - ui::topbar::TOP_BAR_HEIGHT).abs() <= 1.0);
+                assert!((bottom.top() - (800.0 - ui::statusbar::STATUS_BAR_HEIGHT)).abs() <= 1.0);
+                assert!((left.right() - ui::sidebar::TOOL_RAIL_WIDTH).abs() <= 1.0);
+                assert!((right.left() - (1280.0 - ui::sidebar::SIDE_PANEL_WIDTH)).abs() <= 1.0);
+                assert!(
+                    center.right() <= right.left() + 0.5,
+                    "central panel ({center:?}) overlapped right panel ({right:?})"
+                );
+                assert!(
+                    center.left() >= left.right() - 0.5,
+                    "central panel ({center:?}) overlapped left rail ({left:?})"
+                );
+                assert!(
+                    center.bottom() <= bottom.top() + 0.5,
+                    "central panel ({center:?}) overlapped status bar ({bottom:?})"
+                );
+                assert!(
+                    center.top() >= top.bottom() - 0.5,
+                    "central panel ({center:?}) overlapped top bar ({top:?})"
+                );
             });
             out.textures_delta.clear();
         };
@@ -625,6 +675,78 @@ mod tests {
     }
 
     #[test]
+    fn panels_never_overlap_across_window_sizes_and_hidpi_scales() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = App::new_headless(1280, 800);
+        theme::apply(&ctx, &app.theme);
+        // Populate recent colours and a long font name to stress right-panel widths.
+        for i in 0..16u8 {
+            app.colors.push_recent(Color32::from_rgb(i * 15, 100, 200));
+        }
+        app.opts.font_family = "Very Long System Font Family Name Regular".into();
+
+        for &(w, h) in &[
+            (940.0_f32, 640.0_f32),
+            (1280.0, 800.0),
+            (1440.0, 900.0),
+            (1920.0, 1080.0),
+        ] {
+            for &ppp in &[1.0_f32, 1.5, 2.0] {
+                for tool in Tool::ALL {
+                    app.set_tool(tool);
+                    let mut raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
+                        ..Default::default()
+                    };
+                    raw.viewports
+                        .entry(raw.viewport_id)
+                        .or_default()
+                        .native_pixels_per_point = Some(ppp);
+                    let mut out = ctx.run_ui(raw, |ui| {
+                        let screen = ui.ctx().content_rect();
+                        let top = app.top_bar(ui, None);
+                        let bottom = app.status_bar(ui);
+                        let left = app.tool_rail(ui);
+                        let right = app.side_panel(ui);
+                        let center = app.canvas(ui);
+
+                        assert!(
+                            (right.width() - ui::sidebar::SIDE_PANEL_WIDTH).abs() <= 1.0,
+                            "right width mismatch at {w}x{h}@{ppp} ({tool:?}): {right:?}"
+                        );
+                        assert!(
+                            (right.right() - screen.right()).abs() <= 1.0,
+                            "right edge mismatch at {w}x{h}@{ppp} ({tool:?}): {right:?}"
+                        );
+                        assert!(
+                            (center.right() - right.left()).abs() <= 1.0,
+                            "center ({center:?}) did not meet right ({right:?}) at {w}x{h}@{ppp}"
+                        );
+                        assert!(
+                            (center.left() - left.right()).abs() <= 1.0,
+                            "center ({center:?}) did not meet left ({left:?}) at {w}x{h}@{ppp}"
+                        );
+                        assert!(
+                            (center.top() - top.bottom()).abs() <= 1.0,
+                            "center ({center:?}) did not meet top ({top:?}) at {w}x{h}@{ppp}"
+                        );
+                        assert!(
+                            (center.bottom() - bottom.top()).abs() <= 1.0,
+                            "center ({center:?}) did not meet bottom ({bottom:?}) at {w}x{h}@{ppp}"
+                        );
+                    });
+                    out.textures_delta.clear();
+                }
+            }
+        }
+        app.tex = None;
+        app.checker_tex = None;
+        let mut cleanup = ctx.run_ui(egui::RawInput::default(), |_| {});
+        cleanup.textures_delta.clear();
+    }
+
+    #[test]
     fn oversize_new_doc_leaves_current_state_untouched() {
         let mut app = App::new_headless(8, 8);
         app.doc.set(2, 2, [20, 40, 60, 255]);
@@ -634,5 +756,255 @@ mod tests {
         assert_eq!((app.doc.w, app.doc.h), (8, 8));
         assert_eq!(app.doc.get(2, 2), Some([20, 40, 60, 255]));
         assert!(app.doc.modified);
+    }
+
+    #[test]
+    fn text_tool_focuses_on_click_captures_shortcuts_and_aligns_caret() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = App::new_headless(800, 500);
+        theme::apply(&ctx, &app.theme);
+        app.set_tool(Tool::Text);
+        let initial_primary = app.colors.primary;
+
+        let run_frame = |app: &mut App, events: Vec<egui::Event>, time: f64| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                events,
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let c = ui.ctx().clone();
+                shortcuts::handle(app, &c, None);
+                let _ = app.top_bar(ui, None);
+                let _ = app.status_bar(ui);
+                let _ = app.tool_rail(ui);
+                let _ = app.side_panel(ui);
+                let _ = app.canvas(ui);
+                app.overlays(&c, None);
+            });
+            out.textures_delta.clear();
+            out.platform_output
+        };
+
+        // Frame 0: initial layout.
+        let _ = run_frame(&mut app, vec![], 0.0);
+
+        // Frames 1 & 2: single primary click on the canvas (press + release).
+        let click_pos = Pos2::new(320.0, 260.0);
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            0.1,
+        );
+        let out_after_release = run_frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            0.16,
+        );
+
+        // Immediately focused with platform IME active — no second click needed.
+        assert!(app.edit.is_editing_text());
+        assert!(app.canvas_text_captures_keys());
+        assert!(out_after_release.ime.is_some());
+
+        // Frame 3: press every single-key tool/colour shortcut + type a long
+        // sentence; none may switch tools or swap colours, and the caret must
+        // track the end of the single unwrapped line.
+        let sample = "bvpeagitlrokhxd [] — long single line that stays on one row æøå";
+        let mut key_events = Vec::new();
+        for t in Tool::ALL {
+            key_events.push(egui::Event::Key {
+                key: t.shortcut_key(),
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        for k in [
+            egui::Key::X,
+            egui::Key::D,
+            egui::Key::Space,
+            egui::Key::OpenBracket,
+            egui::Key::CloseBracket,
+        ] {
+            key_events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        key_events.push(egui::Event::Text(sample.to_owned()));
+        let _ = run_frame(&mut app, key_events, 0.25);
+
+        assert_eq!(app.tool, Tool::Text, "typing must never switch tools");
+        assert_eq!(
+            app.colors.primary, initial_primary,
+            "X/D must not swap colours"
+        );
+        assert!(!app.space_pan, "Space must not enter pan mode while typing");
+        assert_eq!(app.text_session().unwrap().text, sample);
+
+        let lay = app.text_layout().unwrap();
+        assert_eq!(
+            lay.lines.len(),
+            1,
+            "single-line text must not wrap into a box"
+        );
+        let (li, cx, _) = lay.caret_pos(app.text_session().unwrap().cursor);
+        assert_eq!(li, 0);
+        assert!((cx - lay.width).abs() < 1e-3);
+        let box_rect = app.edit.text_box_rect.unwrap();
+        assert!(
+            box_rect.width() >= lay.width * app.view.zoom,
+            "text frame ({box_rect:?}) must expand with full line width ({})",
+            lay.width * app.view.zoom
+        );
+
+        // Frame 4: Enter inserts line 2, IME preedit + commit appends é, and
+        // Backspace removes the trailing '!'.
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text("Caf".to_owned()),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "´".to_owned(),
+                    active_range_chars: None,
+                }),
+                egui::Event::Ime(egui::ImeEvent::Commit("é!".to_owned())),
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            0.4,
+        );
+        assert_eq!(app.text_session().unwrap().text, format!("{sample}\nCafé"));
+        assert_eq!(app.text_layout().unwrap().lines.len(), 2);
+
+        // Frame 5: clicking elsewhere on the canvas commits the text cleanly
+        // as a single undoable action.
+        let outside = Pos2::new(220.0, 520.0);
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            0.6,
+        );
+        assert!(!app.edit.is_editing_text());
+        assert_eq!(app.hist.undo_len(), 1);
+        assert!(app.doc.modified);
+
+        app.undo();
+        assert!(!app.doc.modified);
+
+        app.tex = None;
+        app.checker_tex = None;
+        let mut cleanup = ctx.run_ui(egui::RawInput::default(), |_| {});
+        cleanup.textures_delta.clear();
+    }
+
+    #[test]
+    fn text_session_selection_undo_reposition_and_escape_behave_natively() {
+        let mut app = App::new_headless(640, 400);
+        app.set_tool(Tool::Text);
+        app.start_text_session(Pos2::new(80.0, 100.0), 0.0, true);
+        assert!(app.canvas_text_captures_keys());
+
+        // Empty session repositions cleanly without losing focus or recording undo.
+        app.reposition_empty_text(Pos2::new(140.0, 160.0), 0.2);
+        assert!(app.canvas_text_captures_keys());
+        assert!((app.text_session().unwrap().pos.0 - 140.0).abs() < 1e-3);
+        assert_eq!(app.hist.undo_len(), 0);
+
+        // Hex & font-filter temporarily borrow keys without ending the session.
+        app.hex_focused = true;
+        assert!(!app.canvas_text_captures_keys());
+        app.hex_focused = false;
+        app.font_filter_focused = true;
+        assert!(!app.canvas_text_captures_keys());
+        app.font_filter_focused = false;
+        assert!(app.canvas_text_captures_keys());
+
+        // Word selection, line selection, delete-word, and in-session undo/redo.
+        {
+            let live = app.text_session_mut().unwrap();
+            live.insert_str("alpha beta_2\ngamma delta");
+            live.checkpoint_undo();
+
+            // Double-click inside "beta_2" selects the whole word.
+            live.select_word_at(8);
+            assert_eq!(live.selected_text(), "beta_2");
+
+            // Triple-click on line 0 selects "alpha beta_2" without the '\n'.
+            live.select_line_at(2);
+            assert_eq!(live.selected_text(), "alpha beta_2");
+
+            // Replace line 0 and verify undo/redo restores it.
+            live.insert_str("replaced");
+            live.checkpoint_undo();
+            assert_eq!(live.text, "replaced\ngamma delta");
+            assert!(live.undo_text());
+            assert_eq!(live.text, "alpha beta_2\ngamma delta");
+            assert!(live.redo_text());
+            assert_eq!(live.text, "replaced\ngamma delta");
+
+            // Vertical caret motion preserves preferred_x across shorter lines.
+            live.insert_str("\nx\n0123456789abcdef");
+        }
+        let lay = app.text_layout().unwrap();
+        let end_idx = app.text_session().unwrap().text.len();
+        let (_, end_x, _) = lay.caret_pos(end_idx);
+        {
+            let live = app.text_session_mut().unwrap();
+            live.set_cursor(end_idx, false, false);
+            // Up onto short "x" line clamps to end of "x", keeping preferred_x.
+            let i1 = lay.vertical_move(live.cursor, -1, &mut live.preferred_x);
+            live.set_cursor(i1, false, true);
+            assert!((live.preferred_x.unwrap() - end_x).abs() < 1e-3);
+            // Down returns right back to the end of "0123456789abcdef".
+            let i2 = lay.vertical_move(live.cursor, 1, &mut live.preferred_x);
+            assert_eq!(i2, end_idx);
+        }
+
+        // Cancel discards the entire session cleanly with zero undo pollution.
+        app.cancel_current();
+        assert!(!app.edit.is_editing_text());
+        assert_eq!(app.hist.undo_len(), 0);
+        assert!(!app.doc.modified);
     }
 }

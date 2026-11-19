@@ -154,6 +154,48 @@ pub(crate) fn button_styled(
     resp
 }
 
+/// Icon + short label, used for the quick-action row in the top bar.
+pub(crate) fn icon_text_button(
+    ui: &mut Ui,
+    th: &Theme,
+    icon: Icon,
+    label: &str,
+    primary: bool,
+) -> Response {
+    let fg = if primary { th.on_accent } else { th.text };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), fg);
+    let galley_size = galley.size();
+    let size = Vec2::new(galley_size.x + 44.0, 32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let t = hover_t(ui, &resp, true);
+    let (bg, border) = if primary {
+        (
+            blend(th.accent, th.on_accent, t * 0.12),
+            Color32::TRANSPARENT,
+        )
+    } else {
+        (
+            blend(blend(th.panel, th.raised, t), th.hover, t * 0.6),
+            th.border,
+        )
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, rr(8), bg);
+    if border != Color32::TRANSPARENT {
+        p.rect_stroke(rect, rr(8), st(1.0, border), StrokeKind::Inside);
+    }
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + 16.0, rect.center().y),
+        Vec2::splat(15.0),
+    );
+    icons::draw(p, icon, icon_rect, fg, 1.5);
+    let text_pos = Pos2::new(rect.left() + 27.0, rect.center().y - galley_size.y * 0.5);
+    p.galley(text_pos, galley, fg);
+    resp
+}
+
 /// Toggle switch with a sliding knob.
 pub(crate) fn toggle(ui: &mut Ui, th: &Theme, on: &mut bool, label: &str) -> Response {
     let (rect, resp) =
@@ -199,31 +241,15 @@ pub(crate) fn slider(
             );
         });
     });
-    ui.spacing_mut().slider_width = (ui.available_width() - 6.0).max(40.0);
-    ui.add(egui::Slider::new(value, range).show_value(false))
-        .changed()
-}
-
-/// Percentage slider row mapping a `0.0..=1.0` value to `0..=100%`.
-pub(crate) fn slider_pct(ui: &mut Ui, th: &Theme, label: &str, value: &mut f32) -> bool {
-    let mut pct = (*value * 100.0).clamp(0.0, 100.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(12.0).color(th.text_dim));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format!("{pct:.0}%"))
-                    .size(12.0)
-                    .color(th.text),
-            );
-        });
-    });
-    ui.spacing_mut().slider_width = (ui.available_width() - 6.0).max(40.0);
+    let prev_slider_w = ui.spacing().slider_width;
+    let prev_interact_y = ui.spacing().interact_size.y;
+    ui.spacing_mut().slider_width = ui.available_width().max(40.0);
+    ui.spacing_mut().interact_size.y = 20.0;
     let changed = ui
-        .add(egui::Slider::new(&mut pct, 0.0..=100.0).show_value(false))
+        .add(egui::Slider::new(value, range).show_value(false))
         .changed();
-    if changed {
-        *value = (pct / 100.0).clamp(0.0, 1.0);
-    }
+    ui.spacing_mut().slider_width = prev_slider_w;
+    ui.spacing_mut().interact_size.y = prev_interact_y;
     changed
 }
 
@@ -249,28 +275,6 @@ pub(crate) fn divider(ui: &mut Ui, th: &Theme) {
         ],
         st(1.0, th.border),
     );
-}
-
-/// Short vertical divider for horizontal toolbars.
-pub(crate) fn vsep(ui: &mut Ui, th: &Theme) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 22.0), Sense::hover());
-    ui.painter().line_segment(
-        [
-            Pos2::new(rect.center().x, rect.top()),
-            Pos2::new(rect.center().x, rect.bottom()),
-        ],
-        st(1.0, th.border),
-    );
-}
-
-/// Framed card container used in the right inspector panel.
-pub(crate) fn card(ui: &mut Ui, th: &Theme, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::NONE
-        .fill(th.panel_alt)
-        .corner_radius(rr(12))
-        .stroke(st(1.0, th.border))
-        .inner_margin(egui::Margin::same(11))
-        .show(ui, add);
 }
 
 /// Draw a colour chip over a subtle checkerboard when translucent.
@@ -302,32 +306,22 @@ pub(crate) fn paint_color_chip(
     p.rect_filled(rect, radius, c);
 }
 
-/// Colour swatch with selection ring.
+/// Colour swatch with selection ring, aligned flush to its allocated rect.
 pub(crate) fn swatch(ui: &mut Ui, th: &Theme, c: Color32, size: f32, selected: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let p = ui.painter();
-    let inner = rect.shrink(1.5);
-    paint_color_chip(p, th, inner, rr(4), c);
+    let chip = rect.shrink(0.5);
+    paint_color_chip(p, th, chip, rr(4), c);
     p.rect_stroke(
-        inner,
+        chip,
         rr(4),
-        st(1.0, Color32::from_black_alpha(40)),
+        st(1.0, Color32::from_black_alpha(45)),
         StrokeKind::Inside,
     );
     if selected {
-        p.rect_stroke(
-            rect.shrink(0.5),
-            rr(5),
-            st(2.0, th.accent),
-            StrokeKind::Inside,
-        );
+        p.rect_stroke(chip, rr(4), st(1.8, th.accent), StrokeKind::Outside);
     } else if resp.hovered() {
-        p.rect_stroke(
-            rect.shrink(0.5),
-            rr(5),
-            st(1.0, th.text_dim),
-            StrokeKind::Inside,
-        );
+        p.rect_stroke(chip, rr(4), st(1.2, th.text_dim), StrokeKind::Outside);
     }
     resp
 }
@@ -398,7 +392,7 @@ pub(crate) fn menu_item(
 
 pub(crate) fn menu_sep(ui: &mut Ui, th: &Theme) {
     let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(180.0), 9.0),
+        Vec2::new(ui.available_width().clamp(180.0, 280.0), 9.0),
         Sense::hover(),
     );
     ui.painter().line_segment(
@@ -462,78 +456,161 @@ pub(crate) fn modal_header(ui: &mut Ui, th: &Theme, title: &str) -> bool {
     close
 }
 
-/// Compact HSV colour picker with persistent `[h, s, v]` state (so picking
-/// white, black, or grey never loses the chosen hue), an exact two-pass SV
-/// gradient mesh, and a single-mesh rainbow hue strip.
+pub(crate) fn srgb_to_hsv([r, g, b]: [u8; 3]) -> [f32; 3] {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+    if delta <= 1e-6 || max <= 1e-6 {
+        return [0.0, 0.0, max];
+    }
+    let s = delta / max;
+    let h = if (max - rf).abs() <= 1e-6 {
+        (gf - bf) / delta
+    } else if (max - gf).abs() <= 1e-6 {
+        2.0 + (bf - rf) / delta
+    } else {
+        4.0 + (rf - gf) / delta
+    };
+    [(h / 6.0).rem_euclid(1.0), s, max]
+}
+
+pub(crate) fn hsv_to_srgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let [hr, hg, hb] = hue_to_rgb(h);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0) * 255.0;
+    [
+        (v * (1.0 - s * (1.0 - hr))).round() as u8,
+        (v * (1.0 - s * (1.0 - hg))).round() as u8,
+        (v * (1.0 - s * (1.0 - hb))).round() as u8,
+    ]
+}
+
+fn hue_to_rgb(h: f32) -> [f32; 3] {
+    let h6 = h.rem_euclid(1.0) * 6.0;
+    let i = h6.floor() as u32;
+    let f = h6 - i as f32;
+    match i {
+        0 => [1.0, f, 0.0],
+        1 => [1.0 - f, 1.0, 0.0],
+        2 => [0.0, 1.0, f],
+        3 => [0.0, 1.0 - f, 1.0],
+        4 => [f, 0.0, 1.0],
+        _ => [1.0, 0.0, 1.0 - f],
+    }
+}
+
+/// Anti-aliased rounded-rectangle coverage (`0..=255`) at pixel `(x, y)`.
+#[inline]
+fn rounded_corner_alpha(x: usize, y: usize, w: usize, h: usize, r: f32) -> u8 {
+    let px = x as f32 + 0.5;
+    let py = y as f32 + 0.5;
+    let wf = w as f32;
+    let hf = h as f32;
+    if (px >= r && px <= wf - r) || (py >= r && py <= hf - r) {
+        return 255;
+    }
+    let cx = if px < r { r } else { wf - r };
+    let cy = if py < r { r } else { hf - r };
+    // Tuck the fill arc by 0.6 px so it terminates cleanly inside the 1 pt
+    // `StrokeKind::Inside` border with zero outer colour fringe.
+    let dist = (px - cx).hypot(py - cy) - (r - 0.6).max(0.0);
+    ((0.5 - dist).clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn build_sv_image(h: f32, w: usize, height: usize, radius_px: f32) -> ColorImage {
+    let [hr, hg, hb] = hue_to_rgb(h);
+    let r_lim = radius_px.min(w.min(height) as f32 * 0.5);
+    let inv_w = 1.0 / w.saturating_sub(1).max(1) as f32;
+    let inv_h = 1.0 / height.saturating_sub(1).max(1) as f32;
+    let mut pixels = Vec::with_capacity(w * height);
+    for y in 0..height {
+        let v = (1.0 - y as f32 * inv_h) * 255.0;
+        let corner_row = (y as f32 + 0.5) < r_lim || (y as f32 + 0.5) > height as f32 - r_lim;
+        for x in 0..w {
+            let s = x as f32 * inv_w;
+            let r = (v * (1.0 - s * (1.0 - hr))).round() as u8;
+            let g = (v * (1.0 - s * (1.0 - hg))).round() as u8;
+            let b = (v * (1.0 - s * (1.0 - hb))).round() as u8;
+            let a = if corner_row {
+                rounded_corner_alpha(x, y, w, height, r_lim)
+            } else {
+                255
+            };
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
+        }
+    }
+    ColorImage {
+        size: [w, height],
+        source_size: Vec2::new(w as f32, height as f32),
+        pixels,
+    }
+}
+
+fn build_hue_image(w: usize, height: usize, radius_px: f32) -> ColorImage {
+    let r_lim = radius_px.min(w.min(height) as f32 * 0.5);
+    let inv_w = 1.0 / w.saturating_sub(1).max(1) as f32;
+    let row_rgb: Vec<[u8; 3]> = (0..w)
+        .map(|x| hsv_to_srgb((x as f32 * inv_w).min(0.9999), 1.0, 1.0))
+        .collect();
+    let mut pixels = Vec::with_capacity(w * height);
+    for y in 0..height {
+        let corner_row = (y as f32 + 0.5) < r_lim || (y as f32 + 0.5) > height as f32 - r_lim;
+        for (x, &[r, g, b]) in row_rgb.iter().enumerate() {
+            let a = if corner_row {
+                rounded_corner_alpha(x, y, w, height, r_lim)
+            } else {
+                255
+            };
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
+        }
+    }
+    ColorImage {
+        size: [w, height],
+        source_size: Vec2::new(w as f32, height as f32),
+        pixels,
+    }
+}
+
+#[derive(Clone)]
+struct PickerTexCache {
+    sv_key: (u16, usize, usize, u32),
+    sv_tex: egui::TextureHandle,
+    hue_key: (usize, usize, u32),
+    hue_tex: egui::TextureHandle,
+}
+
+/// Full-width sRGB HSV colour picker with persistent `[h, s, v]` state (so
+/// picking white, black, or grey never loses the chosen hue) and cached,
+/// HiDPI-exact rounded SV and hue gradient textures.
 pub(crate) fn color_picker(
     ui: &mut Ui,
     th: &Theme,
     color: &mut Color32,
     hsv_cache: &mut (Color32, [f32; 3]),
 ) -> bool {
-    use eframe::egui::TextureId;
-    use eframe::egui::ecolor::Hsva;
-    use eframe::egui::epaint::{Mesh, Vertex, WHITE_UV};
+    const SV_RADIUS: u8 = 5;
+    const HUE_RADIUS: u8 = 6;
+    const UV_FULL: Rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
     // Resync `[h, s, v]` only when the colour was modified outside the picker
     // (palette swatch, hex box, eyedropper, swap/reset).
     if hsv_cache.0 != *color {
-        let converted = Hsva::from_srgb([color.r(), color.g(), color.b()]);
+        let [ch, cs, cv] = srgb_to_hsv([color.r(), color.g(), color.b()]);
         let prev_h = hsv_cache.1[0];
-        let h = if converted.s <= 1e-4 || converted.v <= 1e-4 {
-            prev_h
-        } else {
-            converted.h
-        };
+        let h = if cs <= 1e-4 || cv <= 1e-4 { prev_h } else { ch };
         hsv_cache.0 = *color;
-        hsv_cache.1 = [h, converted.s, converted.v];
+        hsv_cache.1 = [h, cs, cv];
     }
 
     let [mut h, mut s, mut v] = hsv_cache.1;
-    let w = ui.available_width();
+    let w = ui.available_width().max(48.0);
     let mut changed = false;
 
-    // --- saturation / value square (two stacked quads = exact bilinear HSV) ---
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 118.0), Sense::click_and_drag());
-    let hue_c: Color32 = Hsva::new(h, 1.0, 1.0, 1.0).into();
-    let mut sv_mesh = Mesh {
-        texture_id: TextureId::default(),
-        vertices: Vec::with_capacity(8),
-        indices: Vec::with_capacity(12),
-    };
-    // Pass 1: horizontal white -> pure hue.
-    for (p, c) in [
-        (rect.left_top(), Color32::WHITE),
-        (rect.right_top(), hue_c),
-        (rect.left_bottom(), Color32::WHITE),
-        (rect.right_bottom(), hue_c),
-    ] {
-        sv_mesh.vertices.push(Vertex {
-            pos: p,
-            uv: WHITE_UV,
-            color: c,
-        });
-    }
-    // Pass 2: vertical transparent -> opaque black (multiplies value cleanly).
-    for (p, c) in [
-        (rect.left_top(), Color32::TRANSPARENT),
-        (rect.right_top(), Color32::TRANSPARENT),
-        (rect.left_bottom(), Color32::BLACK),
-        (rect.right_bottom(), Color32::BLACK),
-    ] {
-        sv_mesh.vertices.push(Vertex {
-            pos: p,
-            uv: WHITE_UV,
-            color: c,
-        });
-    }
-    sv_mesh
-        .indices
-        .extend_from_slice(&[0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7]);
-    ui.painter().add(egui::Shape::mesh(sv_mesh));
-    ui.painter()
-        .rect_stroke(rect, rr(2), st(1.0, th.border), StrokeKind::Inside);
-
+    // --- saturation / value field --------------------------------------------
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 124.0), Sense::click_and_drag());
     if (resp.is_pointer_button_down_on() || resp.dragged())
         && let Some(p) = resp.interact_pointer_pos()
     {
@@ -541,72 +618,118 @@ pub(crate) fn color_picker(
         v = 1.0 - ((p.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
         changed = true;
     }
-    let knob = Pos2::new(
-        rect.left() + s * rect.width(),
-        rect.top() + (1.0 - v) * rect.height(),
-    );
-    ui.painter()
-        .circle_stroke(knob, 6.0, st(2.0, Color32::WHITE));
-    ui.painter()
-        .circle_stroke(knob, 7.5, st(1.0, Color32::from_black_alpha(90)));
 
-    ui.add_space(8.0);
+    ui.add_space(9.0);
 
-    // --- hue strip (exact 6-segment piecewise-linear HSV rainbow mesh) -------
-    let (hrect, hresp) = ui.allocate_exact_size(Vec2::new(w, 12.0), Sense::click_and_drag());
-    let mut hue_mesh = Mesh {
-        texture_id: TextureId::default(),
-        vertices: Vec::with_capacity(14),
-        indices: Vec::with_capacity(36),
-    };
-    const STOPS: u32 = 6;
-    for i in 0..=STOPS {
-        let t = i as f32 / STOPS as f32;
-        let x = hrect.left() + t * hrect.width();
-        let c: Color32 = Hsva::new(t.min(0.9999), 1.0, 1.0, 1.0).into();
-        hue_mesh.vertices.push(Vertex {
-            pos: Pos2::new(x, hrect.top()),
-            uv: WHITE_UV,
-            color: c,
-        });
-        hue_mesh.vertices.push(Vertex {
-            pos: Pos2::new(x, hrect.bottom()),
-            uv: WHITE_UV,
-            color: c,
-        });
-        if i < STOPS {
-            let b = i * 2;
-            hue_mesh
-                .indices
-                .extend_from_slice(&[b, b + 2, b + 1, b + 1, b + 2, b + 3]);
-        }
-    }
-    ui.painter().add(egui::Shape::mesh(hue_mesh));
-    ui.painter()
-        .rect_stroke(hrect, rr(2), st(1.0, th.border), StrokeKind::Inside);
-
+    // --- rainbow hue strip ---------------------------------------------------
+    let (hrect, hresp) = ui.allocate_exact_size(Vec2::new(w, 13.0), Sense::click_and_drag());
     if (hresp.is_pointer_button_down_on() || hresp.dragged())
         && let Some(p) = hresp.interact_pointer_pos()
     {
         h = ((p.x - hrect.left()) / hrect.width().max(1.0)).clamp(0.0, 1.0);
         changed = true;
     }
+
+    // Build / reuse cached HiDPI-rounded SV & hue textures (recomputed only
+    // when hue, width, or DPI scale changes).
+    let ctx = ui.ctx().clone();
+    let ppp = ctx.pixels_per_point().clamp(1.0, 4.0);
+    let sv_r_px = SV_RADIUS as f32 * ppp;
+    let hue_r_px = HUE_RADIUS as f32 * ppp;
+    let sv_pw = ((rect.width() * ppp).round() as usize).clamp(16, 1024);
+    let sv_ph = ((rect.height() * ppp).round() as usize).clamp(16, 1024);
+    let hue_pw = ((hrect.width() * ppp).round() as usize).clamp(16, 1024);
+    let hue_ph = ((hrect.height() * ppp).round() as usize).clamp(8, 256);
+    let hue_q = ((h.rem_euclid(1.0) * 1536.0).round() as u16) % 1536;
+    let sv_key = (hue_q, sv_pw, sv_ph, (sv_r_px * 16.0).round() as u32);
+    let hue_key = (hue_pw, hue_ph, (hue_r_px * 16.0).round() as u32);
+
+    let cache_id = ui.make_persistent_id("hsv-picker-tex");
+    let cached = ctx.data(|data| data.get_temp::<PickerTexCache>(cache_id));
+    let (sv_id, hue_id) = if let Some(mut entry) = cached {
+        let mut updated = false;
+        if entry.sv_key != sv_key {
+            entry.sv_tex.set(
+                build_sv_image(h, sv_pw, sv_ph, sv_r_px),
+                egui::TextureOptions::LINEAR,
+            );
+            entry.sv_key = sv_key;
+            updated = true;
+        }
+        if entry.hue_key != hue_key {
+            entry.hue_tex.set(
+                build_hue_image(hue_pw, hue_ph, hue_r_px),
+                egui::TextureOptions::LINEAR,
+            );
+            entry.hue_key = hue_key;
+            updated = true;
+        }
+        let ids = (entry.sv_tex.id(), entry.hue_tex.id());
+        if updated {
+            ctx.data_mut(|data| data.insert_temp(cache_id, entry));
+        }
+        ids
+    } else {
+        let sv_tex = ctx.load_texture(
+            "picker-sv",
+            build_sv_image(h, sv_pw, sv_ph, sv_r_px),
+            egui::TextureOptions::LINEAR,
+        );
+        let hue_tex = ctx.load_texture(
+            "picker-hue",
+            build_hue_image(hue_pw, hue_ph, hue_r_px),
+            egui::TextureOptions::LINEAR,
+        );
+        let ids = (sv_tex.id(), hue_tex.id());
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                cache_id,
+                PickerTexCache {
+                    sv_key,
+                    sv_tex,
+                    hue_key,
+                    hue_tex,
+                },
+            );
+        });
+        ids
+    };
+
+    let p = ui.painter();
+    p.image(sv_id, rect, UV_FULL, Color32::WHITE);
+    p.rect_stroke(rect, rr(SV_RADIUS), st(1.0, th.border), StrokeKind::Inside);
+
+    p.image(hue_id, hrect, UV_FULL, Color32::WHITE);
+    p.rect_stroke(
+        hrect,
+        rr(HUE_RADIUS),
+        st(1.0, th.border),
+        StrokeKind::Inside,
+    );
+
+    let knob = Pos2::new(
+        rect.left() + s * rect.width(),
+        rect.top() + (1.0 - v) * rect.height(),
+    );
+    p.circle_stroke(knob, 7.0, st(1.0, Color32::from_black_alpha(110)));
+    p.circle_stroke(knob, 5.5, st(2.0, Color32::WHITE));
+    p.circle_stroke(knob, 4.2, st(1.0, Color32::from_black_alpha(65)));
+
     let hx = hrect.left() + h * hrect.width();
     let mark = Rect::from_min_max(
         Pos2::new(hx - 3.0, hrect.top() - 2.0),
         Pos2::new(hx + 3.0, hrect.bottom() + 2.0),
     );
-    ui.painter()
-        .rect_stroke(mark, rr(2), st(2.0, Color32::WHITE), StrokeKind::Inside);
-    ui.painter().rect_stroke(
+    p.rect_stroke(
         mark,
-        rr(2),
-        st(1.0, Color32::from_black_alpha(90)),
+        rr(3),
+        st(1.0, Color32::from_black_alpha(110)),
         StrokeKind::Outside,
     );
+    p.rect_stroke(mark, rr(3), st(2.0, Color32::WHITE), StrokeKind::Inside);
 
     if changed {
-        let [r, g, b] = Hsva::new(h, s, v, 1.0).to_srgb();
+        let [r, g, b] = hsv_to_srgb(h, s, v);
         let next = Color32::from_rgba_unmultiplied(r, g, b, color.a());
         hsv_cache.0 = next;
         hsv_cache.1 = [h, s, v];
@@ -650,4 +773,45 @@ pub(crate) fn drop_field(ui: &mut Ui, th: &Theme, label: &str) -> Response {
     mesh.indices.extend_from_slice(&[0, 1, 2]);
     p.add(egui::Shape::mesh(mesh));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::PALETTE;
+
+    #[test]
+    fn srgb_hsv_roundtrips_palette_and_extremes() {
+        let extras = [
+            Color32::from_rgb(0x1a, 0x1c, 0x22),
+            Color32::BLACK,
+            Color32::WHITE,
+            Color32::from_rgb(0x80, 0x80, 0x80),
+            Color32::from_rgb(0xff, 0x00, 0x00),
+            Color32::from_rgb(0x00, 0xff, 0x00),
+            Color32::from_rgb(0x00, 0x00, 0xff),
+        ];
+        for c in PALETTE.iter().copied().chain(extras) {
+            let src = [c.r(), c.g(), c.b()];
+            let [h, s, v] = srgb_to_hsv(src);
+            assert_eq!(hsv_to_srgb(h, s, v), src, "roundtrip mismatch for {src:?}");
+        }
+        // Hue wraps seamlessly at both ends of the slider.
+        assert_eq!(hsv_to_srgb(0.0, 1.0, 1.0), [255, 0, 0]);
+        assert_eq!(hsv_to_srgb(1.0, 1.0, 1.0), [255, 0, 0]);
+    }
+
+    #[test]
+    fn picker_gradient_images_mask_outer_corners_cleanly() {
+        let sv = build_sv_image(0.0, 128, 64, 10.0);
+        assert_eq!(sv.pixels[0].a(), 0);
+        assert_eq!(sv.pixels[127].a(), 0);
+        assert_eq!(sv.pixels[64 * 128 - 1].a(), 0);
+        assert_eq!(sv.pixels[32 * 128 + 64].a(), 255);
+
+        let hue = build_hue_image(128, 26, 12.0);
+        assert_eq!(hue.pixels[0].a(), 0);
+        assert_eq!(hue.pixels[127].a(), 0);
+        assert_eq!(hue.pixels[13 * 128 + 64].a(), 255);
+    }
 }

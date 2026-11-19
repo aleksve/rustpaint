@@ -6,6 +6,21 @@ use crate::app::Btn;
 use crate::ir::IRect;
 use crate::paint::{Session, SessionKind};
 
+/// Active pointer gesture on a live canvas text session.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum TextDrag {
+    #[default]
+    None,
+    /// Dragging inside the text box to extend the character selection.
+    Select,
+    /// Dragging the text box border ring to reposition the text block.
+    Move,
+    /// Swallowing the rest of a press that just created, repositioned, or
+    /// committed a text session so pointer movement/release never triggers a
+    /// stray edit.
+    Swallowed,
+}
+
 /// Editing state that is transient with respect to the current document.
 #[derive(Default)]
 pub(crate) struct EditState {
@@ -13,7 +28,11 @@ pub(crate) struct EditState {
     pub(crate) selection: Option<IRect>,
     pub(crate) select_drag_start: Option<(i32, i32)>,
     pub(crate) move_float_origin: Option<(i32, i32)>,
-    pub(crate) text_editor_rect: Option<Rect>,
+    /// Screen-space bounds of the floating `Move / Apply / Cancel` text pill.
+    pub(crate) text_toolbar_rect: Option<Rect>,
+    /// Screen-space interior bounds of the live canvas text box (caret & glyphs).
+    pub(crate) text_box_rect: Option<Rect>,
+    pub(crate) text_drag: TextDrag,
     pub(crate) dragging: Option<Btn>,
     /// Last `(pointer_pos, shift)` processed during a drag, avoiding redundant
     /// re-rasterisation and texture uploads when the pointer is stationary.
@@ -23,12 +42,18 @@ pub(crate) struct EditState {
 }
 
 impl EditState {
+    pub(crate) fn clear_text_ui(&mut self) {
+        self.text_toolbar_rect = None;
+        self.text_box_rect = None;
+        self.text_drag = TextDrag::None;
+    }
+
     /// Clear any active gesture without discarding a committed marquee selection.
     pub(crate) fn reset_gesture(&mut self) {
         self.session = None;
         self.select_drag_start = None;
         self.move_float_origin = None;
-        self.text_editor_rect = None;
+        self.clear_text_ui();
         self.dragging = None;
         self.last_drag_input = None;
         self.last_polygon_hover = None;

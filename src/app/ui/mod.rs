@@ -1,6 +1,6 @@
 //! User-interface panels and canvas rendering.
 
-mod canvas;
-mod sidebar;
-mod statusbar;
-mod topbar;
+pub(crate) mod canvas;
+pub(crate) mod sidebar;
+pub(crate) mod statusbar;
+pub(crate) mod topbar;
