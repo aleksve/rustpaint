@@ -18,6 +18,11 @@ pub(crate) struct Clip {
 #[derive(Default)]
 pub(crate) struct ImageClipboard {
     local: Option<Clip>,
+    // The system handle may be absent because it is unavailable, not yet
+    // initialized, or intentionally disabled (e.g. in tests). Keep the
+    // intentional-disable state explicit so local-only use never lazily opens
+    // the native clipboard when `get` or `set` is called.
+    system_enabled: bool,
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     system: Option<arboard::Clipboard>,
 }
@@ -26,6 +31,7 @@ impl ImageClipboard {
     pub fn new() -> Self {
         Self {
             local: None,
+            system_enabled: true,
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             system: arboard::Clipboard::new().ok(),
         }
@@ -40,7 +46,7 @@ impl ImageClipboard {
     /// Store an RGBA image into the local buffer and (best-effort) the OS clipboard.
     pub fn set(&mut self, clip: Clip) {
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-        {
+        if self.system_enabled {
             if self.system.is_none() {
                 self.system = arboard::Clipboard::new().ok();
             }
@@ -60,7 +66,7 @@ impl ImageClipboard {
     /// screenshots/images paste cleanly, falling back to the in-app buffer.
     pub fn get(&mut self) -> Result<Option<Clip>, DimensionError> {
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-        {
+        if self.system_enabled {
             if self.system.is_none() {
                 self.system = arboard::Clipboard::new().ok();
             }
@@ -100,7 +106,7 @@ impl ImageClipboard {
 
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn has_system_backend(&self) -> bool {
-        self.system.is_some()
+        self.system_enabled && self.system.is_some()
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
